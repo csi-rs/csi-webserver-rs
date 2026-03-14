@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ─── Device config (cached state) ─────────────────────────────────────────
 
@@ -184,4 +185,27 @@ pub struct OutputModeConfig {
 pub struct ApiResponse {
     pub success: bool,
     pub message: String,
+}
+
+// ─── Runtime status ───────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct CollectionStatusResponse {
+    pub serial_connected: bool,
+    pub collection_running: bool,
+    pub port_path: String,
+}
+
+impl CollectionStatusResponse {
+    pub fn from_state(
+        serial_connected: &AtomicBool,
+        collection_running: &AtomicBool,
+        port_path: String,
+    ) -> Self {
+        Self {
+            serial_connected: serial_connected.load(Ordering::SeqCst),
+            collection_running: collection_running.load(Ordering::SeqCst),
+            port_path,
+        }
+    }
 }

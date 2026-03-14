@@ -1,4 +1,5 @@
 use axum::{Json, extract::State, http::StatusCode};
+use std::sync::atomic::Ordering;
 
 use crate::{
     models::{
@@ -150,6 +151,16 @@ pub async fn set_output_mode(
 // ─── Shared helper ──────────────────────────────────────────────────────────
 
 async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiResponse>) {
+    if !state.serial_connected.load(Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse {
+                success: false,
+                message: "ESP32 disconnected; serial command unavailable".to_string(),
+            }),
+        );
+    }
+
     match state.cmd_tx.send(cmd.clone()).await {
         Ok(_) => (
             StatusCode::OK,
@@ -158,12 +169,25 @@ async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiRespons
                 message: format!("Sent: {cmd}"),
             }),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse {
-                success: false,
-                message: format!("Failed to send command: {e}"),
-            }),
-        ),
+        Err(e) => {
+            let (status, message) = if !state.serial_connected.load(Ordering::SeqCst) {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ESP32 disconnected; serial command unavailable".to_string(),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to send command: {e}"),
+                )
+            };
+            (
+                status,
+                Json(ApiResponse {
+                    success: false,
+                    message,
+                }),
+            )
+        }
     }
 }

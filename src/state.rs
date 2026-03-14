@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::models::{DeviceConfig, OutputMode};
@@ -9,7 +10,11 @@ pub struct AppState {
     /// USB serial port path used to reach the ESP32 (e.g. `/dev/ttyUSB0`).
     /// Stored so route handlers can open a short-lived second fd for control
     /// operations such as RTS-triggered reset.
-    pub port_path: Arc<String>,
+    pub port_path: Arc<Mutex<String>>,
+    /// Whether the serial task currently has an open and healthy ESP32 link.
+    pub serial_connected: Arc<AtomicBool>,
+    /// Best-effort flag: true after successful `start`, false after reset/disconnect.
+    pub collection_running: Arc<AtomicBool>,
     /// Send CLI command strings to the serial background task.
     pub cmd_tx: mpsc::Sender<String>,
     /// Broadcast raw CSI frame bytes to all connected WebSocket clients.

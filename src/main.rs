@@ -4,6 +4,7 @@ mod serial;
 mod state;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::{
     Router,
@@ -65,7 +66,9 @@ async fn main() {
 
     // ── Shared state ──────────────────────────────────────────────────────
     let state = AppState {
-        port_path: Arc::new(port_path.clone()),
+        port_path: Arc::new(Mutex::new(port_path.clone())),
+        serial_connected: Arc::new(AtomicBool::new(false)),
+        collection_running: Arc::new(AtomicBool::new(false)),
         cmd_tx,
         csi_tx: csi_tx.clone(),
         log_mode_tx: Arc::new(log_mode_tx),
@@ -82,6 +85,9 @@ async fn main() {
         log_mode_rx,
         output_mode_rx,
         session_file_rx,
+        state.serial_connected.clone(),
+        state.collection_running.clone(),
+        state.port_path.clone(),
     ));
 
     // ── Router ────────────────────────────────────────────────────────────
@@ -106,6 +112,10 @@ async fn main() {
         .route(
             "/api/control/start",
             post(routes::control::start_collection),
+        )
+        .route(
+            "/api/control/status",
+            get(routes::control::get_collection_status),
         )
         .route("/api/control/reset", post(routes::control::reset_esp32))
         // WebSocket
