@@ -67,6 +67,7 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
     };
 
     // Assert RTS → EN pulled low (chip in reset)
+    let _ = port.write_data_terminal_ready(false);
     if let Err(e) = port.write_request_to_send(true) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

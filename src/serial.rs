@@ -131,6 +131,7 @@ pub async fn run_serial_task(
 
         // Auto-reset ESP32 right after a successful serial connection.
         // This matches the devkit EN/RTS wiring used by ESP32 USB-UART boards.
+        let _ = stream.write_data_terminal_ready(false);
         if let Err(e) = stream.write_request_to_send(true) {
             tracing::warn!("Failed to assert RTS on {port_path}: {e}");
         } else {
@@ -225,13 +226,12 @@ async fn run_serial_connection(
 
         // Pick the frame delimiter based on the current log mode.
         // COBS uses null-byte (0x00) framing; all text modes use newline.
-        let delimiter = {
-            let mode = log_mode_rx.borrow();
-            if mode.to_ascii_lowercase().contains("cobs") {
-                b'\0'
-            } else {
-                b'\n'
-            }
+        let mode_str = log_mode_rx.borrow().to_ascii_lowercase();
+        let is_text_mode = mode_str.contains("text");
+        let delimiter = if mode_str.contains("cobs") {
+            b'\0'
+        } else {
+            b'\n'
         };
 
         tokio::select! {
@@ -242,7 +242,21 @@ async fn run_serial_connection(
                         return ConnectionExit::Disconnected;
                     }
                     Ok(_) => {
+                        if is_text_mode {
+                            // Text mode packets span multiple lines.
+                            // The final line contains the actual CSI data array.
+                            let text = String::from_utf8_lossy(&buf);
+                            if !text.contains("csi raw data:") && buf.len() < 65536 {
+                                // Keep accumulating lines for the same packet.
+                                continue;
+                            }
+                        }
+
                         if buf.last() == Some(&delimiter) {
+                            buf.pop();
+                        }
+                        // For multiline text mode we might also want to strip a trailing \r from the last line
+                        if is_text_mode && buf.last() == Some(&b'\r') {
                             buf.pop();
                         }
                         if !buf.is_empty() {
@@ -273,7 +287,7 @@ async fn run_serial_connection(
                 match cmd {
                     Some(cmd) => {
                         tracing::debug!("→ ESP32: {cmd}");
-                        let line = format!("{cmd}\n");
+                        let line = format!("{cmd}\r\n");
                         if let Err(e) = writer.write_all(line.as_bytes()).await {
                             tracing::error!("Serial write error: {e}");
                             return ConnectionExit::Disconnected;
