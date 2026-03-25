@@ -182,7 +182,9 @@ Accepted values: `collector`, `listener`.
 ---
 
 #### `POST /api/config/log-mode`
-Set the serial framing format used by the ESP32 firmware. The server forwards the value to the device and immediately updates its serial frame parsing behavior.
+Set the serial framing format used by the ESP32 firmware.
+
+This endpoint now enforces the same mode set used by `esp-csi-cli-rs` (`set-log-mode --mode=<...>`).
 
 **Body**
 ```json
@@ -191,11 +193,11 @@ Set the serial framing format used by the ESP32 firmware. The server forwards th
 
 | Mode value | Server behavior | Notes |
 |------------|-----------------|-------|
-| `cobs` (or any value containing `cobs`) | Uses `\0` as frame delimiter | COBS-encoded binary framing |
-| `text` (or any value containing `text`) | Uses `\n` delimiter and multiline text-packet assembly | Waits for a line containing `csi raw data:` before emitting a frame |
-| Any other value (for example `array-list`, `none`) | Uses `\n` delimiter | Value is still sent to firmware as-is |
+| `text` | Uses `\n` delimiter and multiline text-packet assembly | Waits for a line containing `csi raw data:` before emitting a frame |
+| `array-list` | Uses `\n` delimiter | One packet per line |
+| `serialized` | Uses `\0` delimiter | Binary COBS-framed postcard output |
 
-The server does not enforce a fixed enum for `mode`; it passes your value through to `set-log-mode --mode=<value>`.
+Any other `mode` value is rejected by the API.
 
 ---
 

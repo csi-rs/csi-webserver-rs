@@ -34,6 +34,10 @@ pub async fn get_collection_status(
 /// Opens a short-lived second file descriptor on the serial port, pulses RTS,
 /// then drops the handle immediately so the main serial task is unaffected.
 pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    // End any active session immediately so the serial task closes dump handles.
+    state.collection_running.store(false, Ordering::SeqCst);
+    let _ = state.session_file_tx.send(None);
+
     if !state.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -54,10 +58,8 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
     let mut port = match tokio_serial::new(current_port.as_str(), baud).open_native_async() {
         Ok(p) => p,
         Err(e) => {
-            state.serial_connected.store(false, Ordering::SeqCst);
-            state.collection_running.store(false, Ordering::SeqCst);
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse {
                     success: false,
                     message: format!("Failed to open serial port for reset: {e}"),
@@ -65,6 +67,11 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
             );
         }
     };
+
+    #[cfg(unix)]
+    {
+        let _ = port.set_exclusive(false);
+    }
 
     // Assert RTS → EN pulled low (chip in reset)
     let _ = port.write_data_terminal_ready(false);
@@ -82,9 +89,6 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
     let _ = port.write_request_to_send(false);
     // Drop the temporary handle; the main serial task is unaffected.
     drop(port);
-
-    state.collection_running.store(false, Ordering::SeqCst);
-    let _ = state.session_file_tx.send(None);
 
     tracing::info!("ESP32 reset via RTS on {}", current_port);
     (
@@ -122,7 +126,7 @@ pub async fn start_collection(
         .is_err()
     {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse {
                 success: false,
                 message: "Collection already running".to_string(),

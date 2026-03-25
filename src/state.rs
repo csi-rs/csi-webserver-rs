@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
-use crate::models::{DeviceConfig, OutputMode};
+use crate::models::{DeviceConfig, LogMode, OutputMode};
 
 /// Shared application state, cheaply cloned into every route handler via Axum's `State` extractor.
 #[derive(Clone)]
@@ -20,7 +20,7 @@ pub struct AppState {
     /// Broadcast raw CSI frame bytes to all connected WebSocket clients.
     pub csi_tx: broadcast::Sender<Vec<u8>>,
     /// Notify the serial task of log-mode changes (affects the frame delimiter).
-    pub log_mode_tx: Arc<watch::Sender<String>>,
+    pub log_mode_tx: Arc<watch::Sender<LogMode>>,
     /// Notify the serial task of output-mode changes (stream / dump / both).
     pub output_mode_tx: Arc<watch::Sender<OutputMode>>,
     /// Signal the serial task of the current session's dump file path.

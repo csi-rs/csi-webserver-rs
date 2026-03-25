@@ -13,7 +13,7 @@ use axum::{
 use clap::Parser;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
-use models::{DeviceConfig, OutputMode};
+use models::{DeviceConfig, LogMode, OutputMode};
 use state::AppState;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ async fn main() {
     // session_file_tx→serial task (current session dump file path)
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>(64);
     let (csi_tx, _) = broadcast::channel::<Vec<u8>>(256);
-    let (log_mode_tx, log_mode_rx) = watch::channel(String::new());
+    let (log_mode_tx, log_mode_rx) = watch::channel(LogMode::default());
     let (output_mode_tx, output_mode_rx) = watch::channel(OutputMode::default());
     let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
 

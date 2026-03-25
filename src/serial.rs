@@ -7,7 +7,7 @@ use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialPortType};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::models::OutputMode;
+use crate::models::{LogMode, OutputMode};
 
 const DEFAULT_BAUD_RATE: u32 = 115_200;
 
@@ -85,7 +85,7 @@ pub fn detect_esp_port() -> Result<String, String> {
 /// - Continuously reconnects if the ESP32 disconnects.
 /// - Reads incoming frames from the serial port and broadcasts the raw bytes
 ///   to all WebSocket subscribers via `csi_tx`. The frame delimiter adapts to
-///   the active log mode: `\0` for COBS, `\n` for all text-based modes.
+///   the active log mode: `\0` for serialized, `\n` for text/array-list.
 /// - Watches `cmd_rx` for outgoing CLI command strings and writes them to the
 ///   port, appending a newline.
 /// - Does NOT set a log mode on startup — call `POST /api/config/log-mode` to
@@ -94,7 +94,7 @@ pub async fn run_serial_task(
     initial_port_path: String,
     mut cmd_rx: mpsc::Receiver<String>,
     csi_tx: broadcast::Sender<Vec<u8>>,
-    log_mode_rx: watch::Receiver<String>,
+    mut log_mode_rx: watch::Receiver<LogMode>,
     mut output_mode_rx: watch::Receiver<OutputMode>,
     mut session_file_rx: watch::Receiver<Option<String>>,
     serial_connected: Arc<AtomicBool>,
@@ -129,6 +129,12 @@ pub async fn run_serial_task(
             }
         };
 
+        #[cfg(unix)]
+        {
+            // Allow opening a short-lived second handle for RTS reset operations.
+            let _ = stream.set_exclusive(false);
+        }
+
         // Auto-reset ESP32 right after a successful serial connection.
         // This matches the devkit EN/RTS wiring used by ESP32 USB-UART boards.
         let _ = stream.write_data_terminal_ready(false);
@@ -151,7 +157,7 @@ pub async fn run_serial_task(
             stream,
             &mut cmd_rx,
             &csi_tx,
-            &log_mode_rx,
+            &mut log_mode_rx,
             &mut output_mode_rx,
             &mut session_file_rx,
         )
@@ -186,7 +192,7 @@ async fn run_serial_connection(
     stream: tokio_serial::SerialStream,
     cmd_rx: &mut mpsc::Receiver<String>,
     csi_tx: &broadcast::Sender<Vec<u8>>,
-    log_mode_rx: &watch::Receiver<String>,
+    log_mode_rx: &mut watch::Receiver<LogMode>,
     output_mode_rx: &mut watch::Receiver<OutputMode>,
     session_file_rx: &mut watch::Receiver<Option<String>>,
 ) -> ConnectionExit {
@@ -197,6 +203,8 @@ async fn run_serial_connection(
     // ── Dump-file state (owned exclusively by this task) ──────────────────
     let mut current_mode = output_mode_rx.borrow().clone();
     let mut current_session_path = session_file_rx.borrow().clone();
+    let mut current_log_mode = log_mode_rx.borrow().clone();
+    let mut drop_next_serialized_chunk = matches!(current_log_mode, LogMode::Serialized);
     let mut dump_file: Option<tokio::fs::File> = None;
 
     // Open dump file immediately if mode/session already require it.
@@ -206,6 +214,7 @@ async fn run_serial_connection(
         // ── React to runtime output-mode or session-file changes ──────────
         let mode_changed = output_mode_rx.has_changed().unwrap_or(false);
         let session_changed = session_file_rx.has_changed().unwrap_or(false);
+        let log_mode_changed = log_mode_rx.has_changed().unwrap_or(false);
 
         if mode_changed {
             current_mode = output_mode_rx.borrow_and_update().clone();
@@ -220,15 +229,25 @@ async fn run_serial_connection(
                 }
             }
         }
+        if log_mode_changed {
+            current_log_mode = log_mode_rx.borrow_and_update().clone();
+            // Drop partial bytes collected under the previous framing mode.
+            buf.clear();
+            // Switching into serialized mode can leave CLI echo bytes queued
+            // before the first COBS frame terminator.
+            if matches!(current_log_mode, LogMode::Serialized) {
+                drop_next_serialized_chunk = true;
+            }
+        }
         if mode_changed || session_changed {
             sync_dump_file(&current_mode, &current_session_path, &mut dump_file).await;
         }
 
-        // Pick the frame delimiter based on the current log mode.
-        // COBS uses null-byte (0x00) framing; all text modes use newline.
-        let mode_str = log_mode_rx.borrow().to_ascii_lowercase();
-        let is_text_mode = mode_str.contains("text");
-        let delimiter = if mode_str.contains("cobs") {
+        // Pick the frame delimiter based on the active mode.
+        // Serialized mode is COBS-framed; text and array-list are newline-framed.
+        let is_text_mode = matches!(current_log_mode, LogMode::Text);
+        let is_array_list_mode = matches!(current_log_mode, LogMode::ArrayList);
+        let delimiter = if matches!(current_log_mode, LogMode::Serialized) {
             b'\0'
         } else {
             b'\n'
@@ -242,12 +261,45 @@ async fn run_serial_connection(
                         return ConnectionExit::Disconnected;
                     }
                     Ok(_) => {
+                        if matches!(current_log_mode, LogMode::Serialized) && drop_next_serialized_chunk {
+                            // Discard the first null-delimited chunk after mode/command transitions.
+                            // It may contain CLI prompt/echo lines buffered before binary frames.
+                            drop_next_serialized_chunk = false;
+                            buf.clear();
+                            continue;
+                        }
+
                         if is_text_mode {
                             // Text mode packets span multiple lines.
                             // The final line contains the actual CSI data array.
                             let text = String::from_utf8_lossy(&buf);
                             if !text.contains("csi raw data:") && buf.len() < 65536 {
                                 // Keep accumulating lines for the same packet.
+                                continue;
+                            }
+
+                            // Ignore command echoes / prompts / startup lines before packet body.
+                            if let Some(start) = find_subsequence(&buf, b"mac:") {
+                                if start > 0 {
+                                    buf.drain(..start);
+                                }
+                            } else {
+                                buf.clear();
+                                continue;
+                            }
+
+                            // Strip control bytes that can appear when switching modes.
+                            buf.retain(|b| {
+                                *b == b'\n' || *b == b'\r' || *b == b'\t' || (*b >= 0x20 && *b <= 0x7E)
+                            });
+                        } else if is_array_list_mode {
+                            // Array-list mode should emit one compact bracketed row per packet.
+                            // Drop CLI echoes, prompts, and boot logs.
+                            while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                                buf.pop();
+                            }
+                            if buf.first() != Some(&b'[') || buf.last() != Some(&b']') {
+                                buf.clear();
                                 continue;
                             }
                         }
@@ -259,14 +311,27 @@ async fn run_serial_connection(
                         if is_text_mode && buf.last() == Some(&b'\r') {
                             buf.pop();
                         }
+
+                        // Keep text outputs frame-separated for dump readability.
+                        if !matches!(current_log_mode, LogMode::Serialized)
+                            && !buf.is_empty()
+                            && buf.last() != Some(&b'\n')
+                        {
+                            buf.push(b'\n');
+                        }
+
                         if !buf.is_empty() {
                             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
                                 if let Some(ref mut file) = dump_file {
-                                    let len = buf.len() as u32;
-                                    if let Err(e) = file.write_all(&len.to_le_bytes()).await {
-                                        tracing::error!("Dump write error (len): {e}");
+                                    if matches!(current_log_mode, LogMode::Serialized) {
+                                        let len = buf.len() as u32;
+                                        if let Err(e) = file.write_all(&len.to_le_bytes()).await {
+                                            tracing::error!("Dump write error (len): {e}");
+                                        } else if let Err(e) = file.write_all(&buf).await {
+                                            tracing::error!("Dump write error (data): {e}");
+                                        }
                                     } else if let Err(e) = file.write_all(&buf).await {
-                                        tracing::error!("Dump write error (data): {e}");
+                                        tracing::error!("Dump write error (text): {e}");
                                     }
                                 }
                             }
@@ -287,6 +352,11 @@ async fn run_serial_connection(
                 match cmd {
                     Some(cmd) => {
                         tracing::debug!("→ ESP32: {cmd}");
+                        if matches!(current_log_mode, LogMode::Serialized) {
+                            // In serialized mode command echoes are text but framing is null-delimited.
+                            // Drop the next chunk to avoid mixing those echoes with binary payload.
+                            drop_next_serialized_chunk = true;
+                        }
                         let line = format!("{cmd}\r\n");
                         if let Err(e) = writer.write_all(line.as_bytes()).await {
                             tracing::error!("Serial write error: {e}");
@@ -300,6 +370,15 @@ async fn run_serial_connection(
             }
         }
     }
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 async fn sync_dump_file(

@@ -135,12 +135,35 @@ impl CollectionModeConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct LogModeConfig {
-    pub mode: String,
+    pub mode: LogMode,
 }
 
 impl LogModeConfig {
     pub fn to_cli_command(&self) -> String {
-        format!("set-log-mode --mode={}", self.mode)
+        format!("set-log-mode --mode={}", self.mode.as_cli_value())
+    }
+}
+
+/// Supported CSI log formats exposed by `esp-csi-cli-rs set-log-mode`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogMode {
+    /// Verbose human-readable output with metadata.
+    Text,
+    /// Compact one-line text output per packet.
+    #[default]
+    ArrayList,
+    /// Binary COBS-framed postcard output.
+    Serialized,
+}
+
+impl LogMode {
+    pub fn as_cli_value(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::ArrayList => "array-list",
+            Self::Serialized => "serialized",
+        }
     }
 }
 
