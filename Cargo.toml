@@ -2,6 +2,21 @@
 name = "csi-webserver"
 version = "0.1.0"
 edition = "2024"
+description = "REST/WebSocket bridge for streaming ESP32 CSI data over USB serial"
+license = "Apache-2.0"
+readme = "CRATES.md"
+repository = "https://github.com/csi-rs/csi-webserver-rs"
+homepage = "https://github.com/csi-rs/csi-webserver-rs"
+documentation = "https://docs.rs/csi-webserver"
+keywords = ["esp32", "csi", "websocket", "serial", "axum"]
+categories = ["web-programming::http-server", "network-programming", "command-line-utilities"]
+rust-version = "1.85"
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "CRATES.md", "API.md", "LICENSE"]
+authors = ["stacks-of-data", "theembeddedrustacean"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 axum = { version = "0.8.8", features = ["ws"] }
@@ -14,7 +29,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["clock"] }
 
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
 [profile.release]
 codegen-units = 1
 lto = true
 debug = false
+opt-level = 3
+[profile.release.package."*"]
+opt-level = 3

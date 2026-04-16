@@ -1,3 +1,5 @@
+//! Handlers for configuration endpoints under `/api/config/*`.
+
 use axum::{
     Json,
     extract::{State, rejection::JsonRejection},

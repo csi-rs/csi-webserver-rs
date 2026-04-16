@@ -1,3 +1,10 @@
+//! Data models used by HTTP handlers and runtime control flow.
+//!
+//! This module contains:
+//! - request-body structs for config/control endpoints,
+//! - runtime enums used by watch channels,
+//! - common API response payloads.
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 

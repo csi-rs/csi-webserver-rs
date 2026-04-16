@@ -1,11 +1,17 @@
+//! Serial-port discovery, connection lifecycle, and frame forwarding.
+//!
+//! The serial task reconnects automatically, accepts command strings from
+//! route handlers, parses incoming frame boundaries based on log mode, then
+//! writes to dump files and/or WebSocket broadcast channels.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Duration, sleep};
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialPortType};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::models::{LogMode, OutputMode};
 

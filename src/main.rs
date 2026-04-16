@@ -1,3 +1,48 @@
+//! Binary entrypoint and composition root for `csi-webserver`.
+//!
+//! This module builds the complete runtime graph for the service:
+//! - parses CLI bind options,
+//! - configures tracing and log filtering,
+//! - discovers the ESP32 serial endpoint,
+//! - creates cross-task channels,
+//! - spawns the serial background worker,
+//! - mounts Axum routes and starts the TCP listener.
+//!
+//! # Service role
+//!
+//! `csi-webserver` is a bridge between ESP32 CSI firmware output and network
+//! consumers. Incoming serial frames are forwarded by the background task to:
+//! - WebSocket subscribers (`/api/ws`),
+//! - session dump files on disk,
+//! - or both, depending on configured output mode.
+//!
+//! Configuration and control commands are exposed as HTTP endpoints and sent to
+//! the serial worker through an async command channel.
+//!
+//! # Startup lifecycle
+//!
+//! 1. Parse `--interface` and `--port`.
+//! 2. Initialize tracing using `RUST_LOG` when provided.
+//! 3. Detect a candidate ESP32 serial device (or exit with an error).
+//! 4. Initialize runtime channels for commands, CSI frames, log mode, output
+//!    mode, and session dump-file path signaling.
+//! 5. Assemble shared [`AppState`](crate::state::AppState) and spawn
+//!    [`serial::run_serial_task`].
+//! 6. Register HTTP routes and begin serving requests.
+//!
+//! # Route surface
+//!
+//! - `GET /` basic health text response.
+//! - `/api/config/*` device and parser configuration.
+//! - `/api/control/*` collection lifecycle and runtime status.
+//! - `GET /api/ws` live binary CSI frame stream.
+//!
+//! # Failure behavior
+//!
+//! If initial serial detection fails, startup exits with status code `1`.
+//! After startup, serial disconnects are handled by the background worker's
+//! reconnect loop, while HTTP routes continue to serve status and errors.
+
 mod models;
 mod routes;
 mod serial;
@@ -19,7 +64,10 @@ use state::AppState;
 // ─── CLI ──────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(version, about = "CSI WebServer — streams ESP32 CSI data over WebSocket")]
+#[command(
+    version,
+    about = "CSI WebServer — streams ESP32 CSI data over WebSocket"
+)]
 struct Cli {
     /// Network interface to bind to.
     #[arg(long, default_value = "0.0.0.0")]

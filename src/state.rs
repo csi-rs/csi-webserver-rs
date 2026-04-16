@@ -1,3 +1,8 @@
+//! Shared application state used by Axum route handlers.
+//!
+//! This state object wraps channels and runtime flags that coordinate route
+//! requests with the long-running serial background task.
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};

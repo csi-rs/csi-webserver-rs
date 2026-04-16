@@ -1,3 +1,5 @@
+//! Handlers for collection control endpoints under `/api/control/*`.
+
 use axum::{Json, extract::State, http::StatusCode};
 use chrono::Local;
 use std::sync::atomic::Ordering;
@@ -144,10 +146,7 @@ pub async fn start_collection(
             // serial task. The file is only opened if the output mode includes
             // Dump; otherwise the path is remembered and used if the mode
             // switches later during the same session.
-            let path = format!(
-                "csi_dump_{}.bin",
-                Local::now().format("%Y%m%d_%H%M%S")
-            );
+            let path = format!("csi_dump_{}.bin", Local::now().format("%Y%m%d_%H%M%S"));
             let current_mode = state.output_mode_tx.borrow().clone();
             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
                 tracing::info!("New session dump file: {path}");

@@ -1,8 +1,9 @@
+//! WebSocket upgrade and frame-stream forwarding endpoint.
+
 use axum::{
     Json,
     extract::{
-        FromRequestParts,
-        State,
+        FromRequestParts, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -27,10 +28,7 @@ use crate::{
 /// Each binary message sent to the client is one unmodified frame as received
 /// from the ESP32 over serial. The client is responsible for decoding based
 /// on the active log mode (e.g. array-list text or COBS binary).
-pub async fn ws_handler(
-    State(state): State<AppState>,
-    req: axum::extract::Request,
-) -> Response {
+pub async fn ws_handler(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     // Check the mode BEFORE attempting the WebSocket upgrade extraction.
     // If WebSocketUpgrade were an extractor in the function signature, Axum
     // would reject non-upgrade requests with 400 before this body runs.
@@ -39,8 +37,7 @@ pub async fn ws_handler(
             StatusCode::FORBIDDEN,
             Json(ApiResponse {
                 success: false,
-                message: "Server is in dump-only mode; WebSocket streaming is disabled"
-                    .to_string(),
+                message: "Server is in dump-only mode; WebSocket streaming is disabled".to_string(),
             }),
         )
             .into_response();
@@ -53,7 +50,8 @@ pub async fn ws_handler(
     };
 
     let rx = state.csi_tx.subscribe();
-    ws.on_upgrade(|socket| handle_socket(socket, rx)).into_response()
+    ws.on_upgrade(|socket| handle_socket(socket, rx))
+        .into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Vec<u8>>) {
