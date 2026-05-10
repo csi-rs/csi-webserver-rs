@@ -7,15 +7,40 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Duration, sleep};
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialPortType};
 
-use crate::models::{LogMode, OutputMode};
+use crate::models::{DeviceInfo, LogMode, OutputMode};
+use crate::state::InfoResponder;
 
-const DEFAULT_BAUD_RATE: u32 = 115_200;
+/// Distinguishes "firmware-not-present / parse-failure" from "the link itself
+/// died" so the caller can decide whether to surface a `Result` or to
+/// reconnect.
+#[derive(Debug)]
+enum InfoExchangeError {
+    /// Logical failure — magic prefix never seen, timed out, or parse error.
+    /// Connection is still healthy.
+    Soft(String),
+    /// I/O failure — connection is broken; the outer loop should reconnect.
+    Hard(String),
+}
+
+impl InfoExchangeError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Soft(m) | Self::Hard(m) => m,
+        }
+    }
+}
+
+/// How long to wait for the device to emit a complete info block before
+/// failing the request. The firmware prints the block synchronously in
+/// response to `info`, so anything significantly above the round-trip time
+/// signals that the firmware is missing or unresponsive.
+const INFO_RESPONSE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Known ESP32 USB-UART adapter Vendor IDs.
 const ESP_USB_VIDS: &[u16] = &[
@@ -98,20 +123,19 @@ pub fn detect_esp_port() -> Result<String, String> {
 ///   configure the device before collecting data.
 pub async fn run_serial_task(
     initial_port_path: String,
+    baud: u32,
     mut cmd_rx: mpsc::Receiver<String>,
     csi_tx: broadcast::Sender<Vec<u8>>,
     mut log_mode_rx: watch::Receiver<LogMode>,
     mut output_mode_rx: watch::Receiver<OutputMode>,
     mut session_file_rx: watch::Receiver<Option<String>>,
+    mut info_request_rx: mpsc::Receiver<InfoResponder>,
     serial_connected: Arc<AtomicBool>,
     collection_running: Arc<AtomicBool>,
+    firmware_verified: Arc<AtomicBool>,
+    device_info: Arc<Mutex<Option<DeviceInfo>>>,
     shared_port_path: Arc<Mutex<String>>,
 ) {
-    let baud = std::env::var("CSI_BAUD_RATE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_BAUD_RATE);
-
     let mut port_path = initial_port_path;
     const RECONNECT_DELAY: Duration = Duration::from_millis(800);
 
@@ -166,11 +190,19 @@ pub async fn run_serial_task(
             &mut log_mode_rx,
             &mut output_mode_rx,
             &mut session_file_rx,
+            &mut info_request_rx,
+            &collection_running,
+            &firmware_verified,
+            &device_info,
         )
         .await;
 
         serial_connected.store(false, Ordering::SeqCst);
         collection_running.store(false, Ordering::SeqCst);
+        // Disconnect invalidates the firmware identity — a different chip
+        // may be re-attached on reconnect, so force a fresh verification.
+        firmware_verified.store(false, Ordering::SeqCst);
+        *device_info.lock().await = None;
 
         match exit {
             ConnectionExit::Disconnected => {
@@ -201,10 +233,43 @@ async fn run_serial_connection(
     log_mode_rx: &mut watch::Receiver<LogMode>,
     output_mode_rx: &mut watch::Receiver<OutputMode>,
     session_file_rx: &mut watch::Receiver<Option<String>>,
+    info_request_rx: &mut mpsc::Receiver<InfoResponder>,
+    collection_running: &Arc<AtomicBool>,
+    firmware_verified: &Arc<AtomicBool>,
+    device_info: &Arc<Mutex<Option<DeviceInfo>>>,
 ) -> ConnectionExit {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
+
+    // ── Auto-verify firmware on connect ───────────────────────────────────
+    // The chip just rebooted via the RTS pulse in run_serial_task. Give it
+    // a moment to finish printing its boot banner, then ask `info` and
+    // mirror the result into AppState. This is what makes command
+    // endpoints unblock without requiring the user to call /api/info first.
+    sleep(Duration::from_millis(700)).await;
+    match do_info_exchange(&mut writer, &mut reader).await {
+        Ok(info) => {
+            tracing::info!(
+                "Firmware verified: esp-csi-cli-rs/{} ({})",
+                info.banner_version,
+                info.chip.as_deref().unwrap_or("unknown chip"),
+            );
+            firmware_verified.store(true, Ordering::SeqCst);
+            *device_info.lock().await = Some(info);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Firmware not verified on {port_path}: {}. Command endpoints will return 412 Precondition Failed until verification succeeds.",
+                e.message(),
+            );
+            firmware_verified.store(false, Ordering::SeqCst);
+            *device_info.lock().await = None;
+            if matches!(e, InfoExchangeError::Hard(_)) {
+                return ConnectionExit::Disconnected;
+            }
+        }
+    }
 
     // ── Dump-file state (owned exclusively by this task) ──────────────────
     let mut current_mode = output_mode_rx.borrow().clone();
@@ -250,9 +315,11 @@ async fn run_serial_connection(
         }
 
         // Pick the frame delimiter based on the active mode.
-        // Serialized mode is COBS-framed; text and array-list are newline-framed.
+        // Serialized mode is COBS-framed; text, array-list and esp-csi-tool
+        // are newline-framed.
         let is_text_mode = matches!(current_log_mode, LogMode::Text);
         let is_array_list_mode = matches!(current_log_mode, LogMode::ArrayList);
+        let is_esp_csi_tool_mode = matches!(current_log_mode, LogMode::EspCsiTool);
         let delimiter = if matches!(current_log_mode, LogMode::Serialized) {
             b'\0'
         } else {
@@ -305,6 +372,21 @@ async fn run_serial_connection(
                                 buf.pop();
                             }
                             if buf.first() != Some(&b'[') || buf.last() != Some(&b']') {
+                                buf.clear();
+                                continue;
+                            }
+                        } else if is_esp_csi_tool_mode {
+                            // Hernandez 26-column CSV. Each row begins with the
+                            // literal label `CSI_DATA,`; drop everything else
+                            // (CLI prompts, boot lines, echoes, headers).
+                            while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                                buf.pop();
+                            }
+                            if let Some(start) = find_subsequence(&buf, b"CSI_DATA,") {
+                                if start > 0 {
+                                    buf.drain(..start);
+                                }
+                            } else {
                                 buf.clear();
                                 continue;
                             }
@@ -374,8 +456,160 @@ async fn run_serial_connection(
                     }
                 }
             }
+
+            req = info_request_rx.recv() => {
+                let Some(responder) = req else { continue };
+
+                if collection_running.load(Ordering::SeqCst) {
+                    let _ = responder.send(Err(
+                        "collection is running; CLI is locked until stop".to_string(),
+                    ));
+                    continue;
+                }
+
+                if matches!(current_log_mode, LogMode::Serialized) {
+                    // The info block is text — drop any partial COBS chunk
+                    // straddling our text exchange.
+                    drop_next_serialized_chunk = true;
+                }
+                // Discard any partial CSI frame the framer was accumulating;
+                // the info exchange runs in line-mode below.
+                buf.clear();
+
+                match do_info_exchange(&mut writer, &mut reader).await {
+                    Ok(info) => {
+                        firmware_verified.store(true, Ordering::SeqCst);
+                        *device_info.lock().await = Some(info.clone());
+                        let _ = responder.send(Ok(info));
+                    }
+                    Err(InfoExchangeError::Soft(msg)) => {
+                        firmware_verified.store(false, Ordering::SeqCst);
+                        *device_info.lock().await = None;
+                        let _ = responder.send(Err(msg));
+                    }
+                    Err(InfoExchangeError::Hard(msg)) => {
+                        firmware_verified.store(false, Ordering::SeqCst);
+                        *device_info.lock().await = None;
+                        let _ = responder.send(Err(msg));
+                        return ConnectionExit::Disconnected;
+                    }
+                }
+            }
         }
     }
+}
+
+/// Issue a single `info` command on the link and read until the `END-INFO`
+/// sentinel arrives or [`INFO_RESPONSE_TIMEOUT`] elapses. Returns
+/// `Soft` errors when the link is healthy but the firmware is not (or not
+/// `esp-csi-cli-rs`); `Hard` errors when the I/O itself failed.
+async fn do_info_exchange<W, R>(
+    writer: &mut W,
+    reader: &mut BufReader<R>,
+) -> Result<DeviceInfo, InfoExchangeError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    if let Err(e) = writer.write_all(b"info\r\n").await {
+        return Err(InfoExchangeError::Hard(format!("Serial write error: {e}")));
+    }
+    if let Err(e) = writer.flush().await {
+        return Err(InfoExchangeError::Hard(format!("Serial flush error: {e}")));
+    }
+
+    let deadline = tokio::time::Instant::now() + INFO_RESPONSE_TIMEOUT;
+    let mut info_buf: Vec<u8> = Vec::new();
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(InfoExchangeError::Soft(
+                "info command timed out; firmware may not be esp-csi-cli-rs".to_string(),
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let read_fut = reader.read_until(b'\n', &mut info_buf);
+        match tokio::time::timeout(remaining, read_fut).await {
+            Ok(Ok(0)) => {
+                return Err(InfoExchangeError::Hard(
+                    "serial closed during info exchange".to_string(),
+                ));
+            }
+            Ok(Ok(_)) => {
+                if find_subsequence(&info_buf, b"END-INFO").is_some() {
+                    return parse_info_block(&info_buf).map_err(InfoExchangeError::Soft);
+                }
+            }
+            Ok(Err(e)) => {
+                return Err(InfoExchangeError::Hard(format!("Serial read error: {e}")));
+            }
+            Err(_) => {
+                return Err(InfoExchangeError::Soft(
+                    "info command timed out; firmware may not be esp-csi-cli-rs".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Parse the firmware-identification block emitted by the device-side
+/// `info` command. The block is delimited by `ESP-CSI-CLI/<version>` (start)
+/// and `END-INFO` (end), with `key=value` lines in between.
+fn parse_info_block(buf: &[u8]) -> Result<DeviceInfo, String> {
+    let text = String::from_utf8_lossy(buf);
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("ESP-CSI-CLI/"))
+        .ok_or_else(|| {
+            "info magic prefix 'ESP-CSI-CLI/' not seen — firmware is not esp-csi-cli-rs"
+                .to_string()
+        })?;
+    let end = lines
+        .iter()
+        .skip(start)
+        .position(|l| *l == "END-INFO")
+        .map(|p| start + p)
+        .ok_or_else(|| "END-INFO sentinel not seen in info block".to_string())?;
+
+    let banner_version = lines[start]
+        .strip_prefix("ESP-CSI-CLI/")
+        .unwrap_or("")
+        .to_string();
+
+    let mut info = DeviceInfo {
+        banner_version,
+        name: None,
+        version: None,
+        chip: None,
+        protocol: None,
+        features: Vec::new(),
+    };
+
+    for line in &lines[start + 1..end] {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        match k {
+            "name" => info.name = Some(v.to_string()),
+            "version" => info.version = Some(v.to_string()),
+            "chip" => info.chip = Some(v.to_string()),
+            "protocol" => info.protocol = v.parse().ok(),
+            "features" => {
+                info.features = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
+    Ok(info)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {

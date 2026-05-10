@@ -26,6 +26,7 @@ Supported board families:
 
 - ESP32
 - ESP32-C3
+- ESP32-C5
 - ESP32-C6
 - ESP32-S3
 
@@ -35,11 +36,14 @@ Supported board families:
 cargo run
 ```
 
-Or run with explicit bind parameters:
+Or run with explicit bind / link parameters:
 
 ```bash
-cargo run -- --interface 127.0.0.1 --port 3000
+cargo run -- --interface 127.0.0.1 --port 3000 --baud-rate 921600
 ```
+
+The baud rate also accepts `CSI_BAUD_RATE` as an environment-variable
+fallback when `--baud-rate` is omitted.
 
 ## Install as a binary
 
@@ -54,19 +58,26 @@ csi-webserver --help
 # 1) Start service
 csi-webserver
 
-# 2) Configure log parser mode
+# 2) Verify the device is running esp-csi-cli-rs
+curl -sS "http://127.0.0.1:3000/api/info"
+
+# 3) Configure log parser mode
 curl -sS -X POST "http://127.0.0.1:3000/api/config/log-mode" \
   -H "Content-Type: application/json" \
   -d '{"mode":"array-list"}'
 
-# 3) Start collection for 60 seconds
-curl -sS -X POST "http://127.0.0.1:3000/api/control/start" \
-  -H "Content-Type: application/json" \
-  -d '{"duration":60}'
+# 4) Start an indefinite collection
+curl -sS -X POST "http://127.0.0.1:3000/api/control/start"
 
-# 4) Check status
+# 5) Check status
 curl -sS "http://127.0.0.1:3000/api/control/status"
+
+# 6) Stop the collection
+curl -sS -X POST "http://127.0.0.1:3000/api/control/stop"
 ```
+
+Pass `{"duration": <secs>}` to `/api/control/start` for a timed run that
+stops on its own.
 
 WebSocket endpoint: `ws://127.0.0.1:3000/api/ws`
 
@@ -85,7 +96,7 @@ Switch at runtime with `POST /api/config/output-mode`.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CSI_SERIAL_PORT` | auto-detect | Override serial port path |
-| `CSI_BAUD_RATE` | `115200` | Override serial baud rate |
+| `CSI_BAUD_RATE` | `115200` | Override serial baud rate (also `--baud-rate`) |
 | `RUST_LOG` | `csi_webserver=debug` | Tracing log filter |
 
 ## License

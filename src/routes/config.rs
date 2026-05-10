@@ -9,8 +9,9 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     models::{
-        ApiResponse, CollectionModeConfig, CsiConfig, DeviceConfig, LogModeConfig, OutputMode,
-        OutputModeConfig, TrafficConfig, WifiConfig,
+        ApiResponse, CollectionModeConfig, CsiConfig, CsiDeliveryConfig, DeviceConfig,
+        IoTasksConfig, LogModeConfig, OutputMode, OutputModeConfig, RateConfig, TrafficConfig,
+        WifiConfig,
     },
     state::AppState,
 };
@@ -39,7 +40,10 @@ pub async fn set_wifi(
     State(state): State<AppState>,
     Json(body): Json<WifiConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    let cmd = body.to_cli_command();
+    let cmd = match body.to_cli_command() {
+        Ok(c) => c,
+        Err(message) => return bad_request(message),
+    };
     let result = send_cmd(&state, cmd).await;
     if result.0 == StatusCode::OK {
         let mut cfg = state.config.lock().await;
@@ -79,7 +83,10 @@ pub async fn set_collection_mode(
     State(state): State<AppState>,
     Json(body): Json<CollectionModeConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    let cmd = body.to_cli_command();
+    let cmd = match body.to_cli_command() {
+        Ok(c) => c,
+        Err(message) => return bad_request(message),
+    };
     let result = send_cmd(&state, cmd).await;
     if result.0 == StatusCode::OK {
         state.config.lock().await.collection_mode = Some(body.mode);
@@ -92,9 +99,10 @@ pub async fn set_collection_mode(
 /// Set the log mode on the device and update the serial task's frame delimiter.
 ///
 /// Supported modes (validated by request deserialization):
-/// - `"text"`       — human-readable multiline packet output
-/// - `"array-list"` — compact one-line text output per packet
-/// - `"serialized"` — COBS-encoded binary frames, null-byte delimited
+/// - `"text"`         — human-readable multiline packet output
+/// - `"array-list"`   — compact one-line text output per packet
+/// - `"serialized"`   — COBS-encoded binary frames, null-byte delimited
+/// - `"esp-csi-tool"` — Hernandez 26-column CSV
 pub async fn set_log_mode(
     State(state): State<AppState>,
     body: Result<Json<LogModeConfig>, JsonRejection>,
@@ -102,13 +110,9 @@ pub async fn set_log_mode(
     let body = match body {
         Ok(Json(body)) => body,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    message: "Invalid log mode. Use one of: text, array-list, serialized"
-                        .to_string(),
-                }),
+            return bad_request(
+                "Invalid log mode. Use one of: text, array-list, serialized, esp-csi-tool"
+                    .to_string(),
             );
         }
     };
@@ -147,15 +151,9 @@ pub async fn set_output_mode(
         "dump" => OutputMode::Dump,
         "both" => OutputMode::Both,
         other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse {
-                    success: false,
-                    message: format!(
-                        "Unknown output mode '{other}'; expected stream, dump, or both"
-                    ),
-                }),
-            );
+            return bad_request(format!(
+                "Unknown output mode '{other}'; expected stream, dump, or both"
+            ));
         }
     };
     let _ = state.output_mode_tx.send(mode);
@@ -168,7 +166,84 @@ pub async fn set_output_mode(
     )
 }
 
-// ─── Shared helper ──────────────────────────────────────────────────────────
+// ─── POST /api/config/rate ──────────────────────────────────────────────────
+
+/// Pin the Wi-Fi PHY rate (only honored by ESP-NOW central / peripheral modes
+/// on the firmware side; sniffer and station ignore it).
+pub async fn set_rate(
+    State(state): State<AppState>,
+    Json(body): Json<RateConfig>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let cmd = body.to_cli_command();
+    let result = send_cmd(&state, cmd).await;
+    if result.0 == StatusCode::OK {
+        state.config.lock().await.phy_rate = Some(body.rate);
+    }
+    result
+}
+
+// ─── POST /api/config/io-tasks ──────────────────────────────────────────────
+
+/// Toggle per-direction TX/RX Embassy tasks. Either or both fields may be set;
+/// omitted fields preserve the current device-side value.
+pub async fn set_io_tasks(
+    State(state): State<AppState>,
+    Json(body): Json<IoTasksConfig>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let cmd = match body.to_cli_command() {
+        Ok(c) => c,
+        Err(message) => return bad_request(message),
+    };
+    let result = send_cmd(&state, cmd).await;
+    if result.0 == StatusCode::OK {
+        let mut cfg = state.config.lock().await;
+        if let Some(tx) = body.tx {
+            cfg.io_tx_enabled = Some(tx);
+        }
+        if let Some(rx) = body.rx {
+            cfg.io_rx_enabled = Some(rx);
+        }
+    }
+    result
+}
+
+// ─── POST /api/config/csi-delivery ──────────────────────────────────────────
+
+/// Switch the CSI delivery path and/or toggle the inline log gate. Either or
+/// both fields may be set; omitted fields preserve the current device-side
+/// value. Takes effect immediately on the firmware (next CSI packet).
+pub async fn set_csi_delivery(
+    State(state): State<AppState>,
+    Json(body): Json<CsiDeliveryConfig>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let cmd = match body.to_cli_command() {
+        Ok(c) => c,
+        Err(message) => return bad_request(message),
+    };
+    let result = send_cmd(&state, cmd).await;
+    if result.0 == StatusCode::OK {
+        let mut cfg = state.config.lock().await;
+        if let Some(mode) = body.mode {
+            cfg.csi_delivery_mode = Some(mode);
+        }
+        if let Some(logging) = body.logging {
+            cfg.csi_logging_enabled = Some(logging);
+        }
+    }
+    result
+}
+
+// ─── Shared helpers ─────────────────────────────────────────────────────────
+
+fn bad_request(message: String) -> (StatusCode, Json<ApiResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse {
+            success: false,
+            message,
+        }),
+    )
+}
 
 async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiResponse>) {
     if !state.serial_connected.load(Ordering::SeqCst) {
@@ -179,6 +254,9 @@ async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiRespons
                 message: "ESP32 disconnected; serial command unavailable".to_string(),
             }),
         );
+    }
+    if let Some(blocked) = state.require_firmware() {
+        return blocked;
     }
 
     match state.cmd_tx.send(cmd.clone()).await {
@@ -210,4 +288,12 @@ async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiRespons
             )
         }
     }
+}
+
+/// Trigger `show-stats` on the device. The actual counter snapshot is printed
+/// over the serial UART by the firmware; on the host side it appears in the
+/// regular CSI output stream (WebSocket / dump file). Requires the firmware
+/// to be built with the `statistics` feature (default-on).
+pub async fn show_stats(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    send_cmd(&state, "show-stats".to_string()).await
 }

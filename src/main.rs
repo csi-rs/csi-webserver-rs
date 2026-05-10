@@ -76,6 +76,11 @@ struct Cli {
     /// TCP port to listen on.
     #[arg(long, default_value_t = 3000)]
     port: u16,
+
+    /// UART baud rate used to talk to the ESP32. Falls back to the
+    /// `CSI_BAUD_RATE` environment variable when the flag is omitted.
+    #[arg(long, env = "CSI_BAUD_RATE", default_value_t = 115_200)]
+    baud_rate: u32,
 }
 
 #[tokio::main]
@@ -111,10 +116,12 @@ async fn main() {
     let (log_mode_tx, log_mode_rx) = watch::channel(LogMode::default());
     let (output_mode_tx, output_mode_rx) = watch::channel(OutputMode::default());
     let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
+    let (info_request_tx, info_request_rx) = mpsc::channel::<state::InfoResponder>(4);
 
     // ── Shared state ──────────────────────────────────────────────────────
     let state = AppState {
         port_path: Arc::new(Mutex::new(port_path.clone())),
+        baud_rate: cli.baud_rate,
         serial_connected: Arc::new(AtomicBool::new(false)),
         collection_running: Arc::new(AtomicBool::new(false)),
         cmd_tx,
@@ -123,18 +130,25 @@ async fn main() {
         output_mode_tx: Arc::new(output_mode_tx),
         session_file_tx: Arc::new(session_file_tx),
         config: Arc::new(Mutex::new(DeviceConfig::default())),
+        info_request_tx,
+        firmware_verified: Arc::new(AtomicBool::new(false)),
+        device_info: Arc::new(Mutex::new(None)),
     };
 
     // ── Serial background task ────────────────────────────────────────────
     tokio::spawn(serial::run_serial_task(
         port_path,
+        cli.baud_rate,
         cmd_rx,
         csi_tx,
         log_mode_rx,
         output_mode_rx,
         session_file_rx,
+        info_request_rx,
         state.serial_connected.clone(),
         state.collection_running.clone(),
+        state.firmware_verified.clone(),
+        state.device_info.clone(),
         state.port_path.clone(),
     ));
 
@@ -156,16 +170,29 @@ async fn main() {
             "/api/config/output-mode",
             post(routes::config::set_output_mode),
         )
+        .route("/api/config/rate", post(routes::config::set_rate))
+        .route("/api/config/io-tasks", post(routes::config::set_io_tasks))
+        .route(
+            "/api/config/csi-delivery",
+            post(routes::config::set_csi_delivery),
+        )
         // Control
         .route(
             "/api/control/start",
             post(routes::control::start_collection),
         )
         .route(
+            "/api/control/stop",
+            post(routes::control::stop_collection),
+        )
+        .route(
             "/api/control/status",
             get(routes::control::get_collection_status),
         )
         .route("/api/control/reset", post(routes::control::reset_esp32))
+        .route("/api/control/stats", post(routes::config::show_stats))
+        // Firmware identification
+        .route("/api/info", get(routes::info::get_info))
         // WebSocket
         .route("/api/ws", get(routes::ws::ws_handler))
         .with_state(state);

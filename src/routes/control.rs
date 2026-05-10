@@ -3,13 +3,22 @@
 use axum::{Json, extract::State, http::StatusCode};
 use chrono::Local;
 use std::sync::atomic::Ordering;
-use tokio::time::{Duration, sleep};
+use tokio::sync::oneshot;
+use tokio::time::{Duration, sleep, timeout};
 use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
 use crate::{
     models::{ApiResponse, CollectionStatusResponse, OutputMode, StartConfig},
     state::AppState,
 };
+
+/// Gives the chip enough time to finish bootloader + early init after the
+/// RTS pulse before the post-reset `info` re-verification fires.
+const POST_RESET_BOOT_DELAY: Duration = Duration::from_millis(800);
+/// Cap on how long the reset endpoint will wait for the re-verification
+/// reply. Longer than the serial-side info timeout to leave headroom for
+/// channel hop-on-hop-off latency.
+const POST_RESET_VERIFY_TIMEOUT: Duration = Duration::from_millis(3000);
 
 // ─── GET /api/control/status ──────────────────────────────────────────────
 
@@ -40,6 +49,13 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
     state.collection_running.store(false, Ordering::SeqCst);
     let _ = state.session_file_tx.send(None);
 
+    // The chip is about to reboot. Whatever firmware ran a moment ago may or
+    // may not be running afterwards (the user might have re-flashed the
+    // device); invalidate the cached identity so command endpoints stay
+    // blocked until the post-reset re-verification confirms it.
+    state.firmware_verified.store(false, Ordering::SeqCst);
+    *state.device_info.lock().await = None;
+
     if !state.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -50,14 +66,9 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
         );
     }
 
-    let baud: u32 = std::env::var("CSI_BAUD_RATE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(115_200);
-
     let current_port = state.port_path.lock().await.clone();
 
-    let mut port = match tokio_serial::new(current_port.as_str(), baud).open_native_async() {
+    let mut port = match tokio_serial::new(current_port.as_str(), state.baud_rate).open_native_async() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -93,13 +104,115 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
     drop(port);
 
     tracing::info!("ESP32 reset via RTS on {}", current_port);
-    (
-        StatusCode::OK,
-        Json(ApiResponse {
-            success: true,
-            message: "ESP32 reset triggered via RTS".to_string(),
-        }),
-    )
+
+    // Wait for the chip to boot, then re-verify firmware identity. The auto-
+    // verify-on-connect path in run_serial_connection only fires when the
+    // serial task itself reconnects; an in-band RTS reset keeps the same fd
+    // open, so the re-verification has to be driven from here.
+    sleep(POST_RESET_BOOT_DELAY).await;
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state.info_request_tx.send(resp_tx).await.is_err() {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message:
+                    "ESP32 reset triggered via RTS, but post-reset re-verification could not be \
+                     queued (serial task is shutting down). Call GET /api/info to retry."
+                        .to_string(),
+            }),
+        );
+    }
+
+    match timeout(POST_RESET_VERIFY_TIMEOUT, resp_rx).await {
+        Ok(Ok(Ok(info))) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: format!(
+                    "ESP32 reset; firmware re-verified: esp-csi-cli-rs/{} ({})",
+                    info.banner_version,
+                    info.chip.as_deref().unwrap_or("unknown chip"),
+                ),
+            }),
+        ),
+        Ok(Ok(Err(reason))) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: format!(
+                    "ESP32 reset; firmware identity could NOT be re-verified \
+                     (esp-csi-cli-rs may not be flashed): {reason}. Command endpoints will \
+                     return 412 Precondition Failed until verification succeeds."
+                ),
+            }),
+        ),
+        Ok(Err(_)) | Err(_) => (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: "ESP32 reset; post-reset re-verification timed out. Call GET /api/info \
+                          to retry."
+                    .to_string(),
+            }),
+        ),
+    }
+}
+
+// ─── POST /api/control/stop ────────────────────────────────────────────────
+
+/// Stop an in-progress collection by sending a `q` byte over the serial port.
+///
+/// While the firmware has `IS_COLLECTING == true` the CLI is locked: only
+/// `q`/`Q` is acted on, every other byte is discarded. The `q` byte triggers
+/// `STOP_REQUEST` on the device, which unwinds both `run_duration` and `run`.
+/// The trailing `\r\n` appended by the serial task is harmlessly discarded
+/// during collection lock.
+pub async fn stop_collection(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    if !state.serial_connected.load(Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse {
+                success: false,
+                message: "ESP32 disconnected; serial command unavailable".to_string(),
+            }),
+        );
+    }
+    if let Some(blocked) = state.require_firmware() {
+        return blocked;
+    }
+
+    if !state.collection_running.load(Ordering::SeqCst) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: "Collection not running".to_string(),
+            }),
+        );
+    }
+
+    match state.cmd_tx.send("q".to_string()).await {
+        Ok(_) => {
+            state.collection_running.store(false, Ordering::SeqCst);
+            let _ = state.session_file_tx.send(None);
+            (
+                StatusCode::OK,
+                Json(ApiResponse {
+                    success: true,
+                    message: "Collection stop requested".to_string(),
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                message: format!("Failed to send stop: {e}"),
+            }),
+        ),
+    }
 }
 
 // ─── POST /api/control/start ────────────────────────────────────────────────
@@ -120,6 +233,9 @@ pub async fn start_collection(
                 message: "ESP32 disconnected; serial command unavailable".to_string(),
             }),
         );
+    }
+    if let Some(blocked) = state.require_firmware() {
+        return blocked;
     }
 
     if state

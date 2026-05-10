@@ -29,6 +29,8 @@ csi-webserver [OPTIONS]
 Options:
       --interface <INTERFACE>  Network interface to bind to [default: 0.0.0.0]
       --port <PORT>            TCP port to listen on [default: 3000]
+      --baud-rate <BAUD_RATE>  UART baud rate to the ESP32 [env: CSI_BAUD_RATE]
+                               [default: 115200]
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -43,6 +45,7 @@ Supported board families:
 
 - ESP32
 - ESP32-C3
+- ESP32-C5
 - ESP32-C6
 - ESP32-S3
 
@@ -52,19 +55,25 @@ Supported board families:
 # 1) Start the server
 csi-webserver
 
-# 2) Set log mode
+# 2) Verify the device is running esp-csi-cli-rs
+curl -sS "http://127.0.0.1:3000/api/info"
+
+# 3) Set log mode
 curl -sS -X POST "http://127.0.0.1:3000/api/config/log-mode" \
   -H "Content-Type: application/json" \
   -d '{"mode":"array-list"}'
 
-# 3) Start a timed collection session
-curl -sS -X POST "http://127.0.0.1:3000/api/control/start" \
-  -H "Content-Type: application/json" \
-  -d '{"duration":60}'
+# 4) Start an indefinite collection session
+curl -sS -X POST "http://127.0.0.1:3000/api/control/start"
 
-# 4) Read runtime status
+# 5) Read runtime status
 curl -sS "http://127.0.0.1:3000/api/control/status"
+
+# 6) Stop the collection
+curl -sS -X POST "http://127.0.0.1:3000/api/control/stop"
 ```
+
+Pass `{"duration": <secs>}` to `/api/control/start` for a timed run.
 
 ## Output modes
 
@@ -81,7 +90,7 @@ Switch at runtime with `POST /api/config/output-mode`.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CSI_SERIAL_PORT` | auto-detect | Override serial port path |
-| `CSI_BAUD_RATE` | `115200` | Override serial baud rate |
+| `CSI_BAUD_RATE` | `115200` | Override serial baud rate (also `--baud-rate`) |
 | `RUST_LOG` | `csi_webserver=debug` | Tracing filter |
 
 ## Full references
