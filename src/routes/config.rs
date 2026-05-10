@@ -29,7 +29,10 @@ pub async fn get_config(State(state): State<AppState>) -> Json<DeviceConfig> {
 pub async fn reset_config(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
     let result = send_cmd(&state, "reset-config".to_string()).await;
     if result.0 == StatusCode::OK {
-        *state.config.lock().await = DeviceConfig::default();
+        // Mirror the firmware's UserConfig::new() / CsiConfig::default()
+        // snapshot so the cache reflects what's actually live on the chip,
+        // even before the user re-sends any `set-*` commands.
+        *state.config.lock().await = DeviceConfig::firmware_defaults();
     }
     result
 }
@@ -47,9 +50,14 @@ pub async fn set_wifi(
     let result = send_cmd(&state, cmd).await;
     if result.0 == StatusCode::OK {
         let mut cfg = state.config.lock().await;
-        cfg.wifi_mode = Some(body.mode);
-        cfg.channel = body.channel;
-        cfg.sta_ssid = body.sta_ssid;
+        cfg.wifi.mode = Some(body.mode);
+        if body.channel.is_some() {
+            cfg.wifi.channel = body.channel;
+        }
+        if body.sta_ssid.is_some() {
+            cfg.wifi.sta_ssid = body.sta_ssid;
+        }
+        // sta_password is intentionally not cached.
     }
     result
 }
@@ -63,7 +71,7 @@ pub async fn set_traffic(
     let cmd = body.to_cli_command();
     let result = send_cmd(&state, cmd).await;
     if result.0 == StatusCode::OK {
-        state.config.lock().await.traffic_hz = Some(body.frequency_hz);
+        state.config.lock().await.collection.traffic_hz = Some(body.frequency_hz);
     }
     result
 }
@@ -74,7 +82,59 @@ pub async fn set_csi(
     State(state): State<AppState>,
     Json(body): Json<CsiConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    send_cmd(&state, body.to_cli_command()).await
+    let result = send_cmd(&state, body.to_cli_command()).await;
+    if result.0 == StatusCode::OK {
+        let mut cfg = state.config.lock().await;
+        // Classic flags — each `disable_*=true` toggles the corresponding
+        // `*_enabled` cached value to false. There is no `enable-*` flag
+        // (the firmware exposes only disables); the only way to revert is
+        // POST /api/config/reset.
+        if body.disable_lltf == Some(true) {
+            cfg.csi_config.lltf_enabled = Some(false);
+        }
+        if body.disable_htltf == Some(true) {
+            cfg.csi_config.htltf_enabled = Some(false);
+        }
+        if body.disable_stbc_htltf == Some(true) {
+            cfg.csi_config.stbc_htltf_enabled = Some(false);
+        }
+        if body.disable_ltf_merge == Some(true) {
+            cfg.csi_config.ltf_merge_enabled = Some(false);
+        }
+        // HE (C5/C6) flags — same disable-only pattern, but stored as the
+        // underlying `acquire_csi_*` u32 (0 = disabled, non-zero = enabled).
+        if body.disable_csi == Some(true) {
+            cfg.csi_config.acquire_csi = Some(0);
+        }
+        if body.disable_csi_legacy == Some(true) {
+            cfg.csi_config.acquire_csi_legacy = Some(0);
+        }
+        if body.disable_csi_ht20 == Some(true) {
+            cfg.csi_config.acquire_csi_ht20 = Some(0);
+        }
+        if body.disable_csi_ht40 == Some(true) {
+            cfg.csi_config.acquire_csi_ht40 = Some(0);
+        }
+        if body.disable_csi_su == Some(true) {
+            cfg.csi_config.acquire_csi_su = Some(0);
+        }
+        if body.disable_csi_mu == Some(true) {
+            cfg.csi_config.acquire_csi_mu = Some(0);
+        }
+        if body.disable_csi_dcm == Some(true) {
+            cfg.csi_config.acquire_csi_dcm = Some(0);
+        }
+        if body.disable_csi_beamformed == Some(true) {
+            cfg.csi_config.acquire_csi_beamformed = Some(0);
+        }
+        if let Some(stbc) = body.csi_he_stbc {
+            cfg.csi_config.csi_he_stbc = Some(stbc);
+        }
+        if let Some(scale) = body.val_scale_cfg {
+            cfg.csi_config.val_scale_cfg = Some(scale);
+        }
+    }
+    result
 }
 
 // ─── POST /api/config/collection-mode ──────────────────────────────────────
@@ -89,7 +149,7 @@ pub async fn set_collection_mode(
     };
     let result = send_cmd(&state, cmd).await;
     if result.0 == StatusCode::OK {
-        state.config.lock().await.collection_mode = Some(body.mode);
+        state.config.lock().await.collection.mode = Some(body.mode);
     }
     result
 }
@@ -177,7 +237,7 @@ pub async fn set_rate(
     let cmd = body.to_cli_command();
     let result = send_cmd(&state, cmd).await;
     if result.0 == StatusCode::OK {
-        state.config.lock().await.phy_rate = Some(body.rate);
+        state.config.lock().await.collection.phy_rate = Some(body.rate);
     }
     result
 }
@@ -198,10 +258,10 @@ pub async fn set_io_tasks(
     if result.0 == StatusCode::OK {
         let mut cfg = state.config.lock().await;
         if let Some(tx) = body.tx {
-            cfg.io_tx_enabled = Some(tx);
+            cfg.collection.io_tx_enabled = Some(tx);
         }
         if let Some(rx) = body.rx {
-            cfg.io_rx_enabled = Some(rx);
+            cfg.collection.io_rx_enabled = Some(rx);
         }
     }
     result

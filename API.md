@@ -112,26 +112,77 @@ Notes:
 
 ### `GET /api/config`
 
-Returns the server-side cached view of device configuration. Best-effort —
-fields are populated from successful `POST /api/config/*` calls.
+Returns the server-side cached view of device configuration, structured to
+mirror the firmware's `show-config` output (`[WiFi]`, `[Collection]`,
+`[CSI Config]`). Best-effort — each field is populated when the matching
+`POST /api/config/*` endpoint succeeds, and reset to firmware defaults by
+`POST /api/config/reset`. Values may drift if the device is re-flashed or
+commands are sent out-of-band.
 
 Example:
 
 ```json
 {
-  "wifi_mode": "sniffer",
-  "channel": 6,
-  "sta_ssid": "MyNetwork",
-  "traffic_hz": 100,
-  "collection_mode": "collector",
+  "wifi": {
+    "mode": "sniffer",
+    "channel": 6,
+    "sta_ssid": "MyNetwork"
+  },
+  "collection": {
+    "mode": "collector",
+    "traffic_hz": 100,
+    "phy_rate": "mcs0-lgi",
+    "io_tx_enabled": true,
+    "io_rx_enabled": true
+  },
+  "csi_config": {
+    "lltf_enabled": true,
+    "htltf_enabled": true,
+    "stbc_htltf_enabled": true,
+    "ltf_merge_enabled": true,
+    "channel_filter_enabled": false,
+    "manual_scale": false,
+    "shift": 0,
+    "dump_ack_enabled": false,
+    "acquire_csi": 1,
+    "acquire_csi_legacy": 1,
+    "acquire_csi_ht20": 1,
+    "acquire_csi_ht40": 1,
+    "acquire_csi_su": 1,
+    "acquire_csi_mu": 1,
+    "acquire_csi_dcm": 1,
+    "acquire_csi_beamformed": 1,
+    "csi_he_stbc": 2,
+    "val_scale_cfg": 2
+  },
   "log_mode": "array-list",
-  "phy_rate": "mcs0-lgi",
-  "io_tx_enabled": true,
-  "io_rx_enabled": true,
   "csi_delivery_mode": "async",
   "csi_logging_enabled": true
 }
 ```
+
+Notes:
+
+- `wifi`, `collection`, `csi_config` mirror the `show-config` sections.
+- `csi_config` carries both classic (ESP32 / ESP32-C3 / ESP32-S3) and HE
+  (ESP32-C5 / ESP32-C6) fields. The ones applicable to the connected chip
+  are populated; the others stay `null`. Check `chip` from `GET /api/info`
+  to know which side to read.
+- The classic fields `channel_filter_enabled`, `manual_scale`, `shift`,
+  `dump_ack_enabled` are **read-only on the device** — they have no
+  `POST /api/config/csi` flag, so they only become non-null after
+  `POST /api/config/reset` (which loads firmware defaults).
+- `sta_password` is intentionally **not cached**; round-tripping plaintext
+  passwords through a GET endpoint would defeat the point.
+- `log_mode`, `csi_delivery_mode`, `csi_logging_enabled` are server-tracked
+  extras not part of `show-config` — they're set via `set-log-mode` /
+  `set-csi-delivery` and surfaced here for convenience.
+- All fields are nullable (`Option<…>`). Absent fields mean "the
+  corresponding endpoint has not been hit since startup / reset-config".
+- After `POST /api/config/reset`, the cache is replaced with the firmware
+  defaults documented in the `show-config` spec (e.g.
+  `wifi.mode = "sniffer"`, `collection.traffic_hz = 100`,
+  `csi_config.csi_he_stbc = 2`).
 
 ### `POST /api/config/reset`
 

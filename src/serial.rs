@@ -408,7 +408,18 @@ async fn run_serial_connection(
                             buf.push(b'\n');
                         }
 
-                        if !buf.is_empty() {
+                        // Only forward to consumers while a session is
+                        // active. After `POST /api/control/stop` flips
+                        // `collection_running` to false, this drops any
+                        // tail-of-session bytes (in-flight CSI frames,
+                        // post-`q` boot text, command echoes) on the floor
+                        // instead of leaking them to WebSocket clients or
+                        // the dump file. The buffer still gets cleared
+                        // below, so the framer keeps draining serial
+                        // input rather than back-pressuring it.
+                        let still_collecting = collection_running.load(Ordering::SeqCst);
+
+                        if still_collecting && !buf.is_empty() {
                             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
                                 if let Some(ref mut file) = dump_file {
                                     if matches!(current_log_mode, LogMode::Serialized) {
@@ -448,6 +459,16 @@ async fn run_serial_connection(
                         let line = format!("{cmd}\r\n");
                         if let Err(e) = writer.write_all(line.as_bytes()).await {
                             tracing::error!("Serial write error: {e}");
+                            return ConnectionExit::Disconnected;
+                        }
+                        // Flush so the bytes leave the host buffer
+                        // immediately. This matters most for the `q`
+                        // stop signal — without an explicit flush, the
+                        // OS may sit on the byte while CSI traffic keeps
+                        // streaming back, delaying the firmware's
+                        // STOP_REQUEST and prolonging the collection.
+                        if let Err(e) = writer.flush().await {
+                            tracing::error!("Serial flush error: {e}");
                             return ConnectionExit::Disconnected;
                         }
                     }
