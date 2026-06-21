@@ -42,6 +42,15 @@ impl InfoExchangeError {
 /// signals that the firmware is missing or unresponsive.
 const INFO_RESPONSE_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// How often the connection loop re-attempts firmware verification while the
+/// link is up but the device is still unverified (and not collecting). The
+/// initial auto-verify on connect can miss — the chip may still be booting,
+/// the RTS reset may not have landed on a native-USB board, or the device may
+/// have been mid-stream when the server started. Without this retry, a device
+/// attached before server start would sit `firmware_verified == false` until a
+/// full reconnect, never becoming usable to clients.
+const REVERIFY_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Known ESP32 USB-UART adapter Vendor IDs.
 const ESP_USB_VIDS: &[u16] = &[
     0x10C4, // Silicon Labs CP210x (most common on ESP32 devkits)
@@ -407,6 +416,13 @@ async fn run_serial_connection(
     // Open dump file immediately if mode/session already require it.
     sync_dump_file(&current_mode, &current_session_path, &mut dump_file).await;
 
+    // Periodically re-attempt firmware verification if the initial auto-verify
+    // above did not succeed. The first tick fires immediately, so consume it
+    // here to avoid re-verifying on the very next loop iteration.
+    let mut reverify = tokio::time::interval(REVERIFY_INTERVAL);
+    reverify.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    reverify.tick().await;
+
     loop {
         // ── React to runtime output-mode or session-file changes ──────────
         let mode_changed = output_mode_rx.has_changed().unwrap_or(false);
@@ -455,6 +471,40 @@ async fn run_serial_connection(
         tokio::select! {
             _ = dev.shutdown.cancelled() => {
                 return ConnectionExit::Shutdown;
+            }
+
+            // ── Re-verify firmware while unverified and idle ──────────────
+            // The branch is disabled once verified or while collecting (the
+            // CLI is locked during collection), so a healthy device stops
+            // probing as soon as it identifies itself.
+            _ = reverify.tick(), if !firmware_verified.load(Ordering::SeqCst)
+                && !collection_running.load(Ordering::SeqCst) =>
+            {
+                if matches!(current_log_mode, LogMode::Serialized) {
+                    drop_next_serialized_chunk = true;
+                }
+                // Drop any partial frame; the info exchange runs in line-mode.
+                buf.clear();
+
+                match do_info_exchange(&mut writer, &mut reader).await {
+                    Ok(info) => {
+                        tracing::info!(
+                            "Firmware verified on retry: esp-csi-cli-rs/{} ({})",
+                            info.banner_version,
+                            info.chip.as_deref().unwrap_or("unknown chip"),
+                        );
+                        firmware_verified.store(true, Ordering::SeqCst);
+                        *device_info.lock().await = Some(info);
+                    }
+                    Err(InfoExchangeError::Soft(_)) => {
+                        // Still not esp-csi-cli-rs (or not responding yet);
+                        // stay unverified and try again on the next tick.
+                    }
+                    Err(InfoExchangeError::Hard(msg)) => {
+                        tracing::warn!("Serial link error during re-verify on {port_path}: {msg}");
+                        return ConnectionExit::Disconnected;
+                    }
+                }
             }
 
             result = reader.read_until(delimiter, &mut buf) => {
