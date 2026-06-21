@@ -4,17 +4,17 @@
 //! route handlers, parses incoming frame boundaries based on log mode, then
 //! writes to dump files and/or WebSocket broadcast channels.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Duration, sleep};
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialPortType};
 
-use crate::models::{DeviceInfo, LogMode, OutputMode};
-use crate::state::InfoResponder;
+use crate::models::{DeviceConfig, DeviceInfo, LogMode, OutputMode};
+use crate::state::{DeviceHandle, DeviceRegistry, InfoResponder};
 
 /// Distinguishes "firmware-not-present / parse-failure" from "the link itself
 /// died" so the caller can decide whether to surface a `Result` or to
@@ -49,24 +49,33 @@ const ESP_USB_VIDS: &[u16] = &[
     0x303A, // Espressif built-in USB (ESP32-S3 / C3 / C6 native USB)
 ];
 
-/// Detect the first available ESP32 USB serial port.
+/// Detect *all* available ESP32 USB serial port paths, sorted so device-id
+/// assignment is deterministic across scans.
 ///
 /// Resolution order:
-/// 1. `CSI_SERIAL_PORT` environment variable override.
-/// 2. First USB port whose name contains `usbserial` / `usbmodem` / `ttyUSB` / `ttyACM`,
-///    or whose VID matches a known ESP chip.
-/// 3. Any USB port as a last resort.
-pub fn detect_esp_port() -> Result<String, String> {
+/// 1. `CSI_SERIAL_PORT` environment variable override (pins a single port).
+/// 2. Every USB port whose name contains `usbserial` / `usbmodem` / `ttyUSB` /
+///    `ttyACM`, or whose VID matches a known ESP chip.
+/// 3. If that heuristic pass found nothing *and* exactly one USB port exists,
+///    that lone port as a last resort. (When several USB ports are present we
+///    refuse to guess, to avoid grabbing unrelated USB serial devices.)
+pub fn detect_esp_ports() -> Vec<String> {
     // Allow the user to pin a specific port without recompiling.
     if let Ok(port) = std::env::var("CSI_SERIAL_PORT") {
-        tracing::info!("Using CSI_SERIAL_PORT override: {port}");
-        return Ok(port);
+        tracing::debug!("Using CSI_SERIAL_PORT override: {port}");
+        return vec![port];
     }
 
-    let ports = tokio_serial::available_ports()
-        .map_err(|e| format!("Failed to enumerate serial ports: {e}"))?;
+    let ports = match tokio_serial::available_ports() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Failed to enumerate serial ports: {e}");
+            return Vec::new();
+        }
+    };
 
     // First pass: match by known VID or recognisable port-name prefix.
+    let mut matched: Vec<String> = Vec::new();
     for port in &ports {
         if let SerialPortType::UsbPort(ref info) = port.port_type {
             let name_ok = port.port_name.contains("usbserial")
@@ -77,38 +86,159 @@ pub fn detect_esp_port() -> Result<String, String> {
             let vid_ok = ESP_USB_VIDS.contains(&info.vid);
 
             if name_ok || vid_ok {
-                let product = info
-                    .product
-                    .as_deref()
-                    .map(|p| format!(", {p}"))
-                    .unwrap_or_default();
-                tracing::info!(
-                    "Auto-detected ESP port: {} (VID:{:04X} PID:{:04X}{product})",
-                    port.port_name,
-                    info.vid,
-                    info.pid,
-                );
-                return Ok(port.port_name.clone());
+                matched.push(port.port_name.clone());
             }
         }
     }
 
-    // Second pass: fall back to any USB port.
-    for port in &ports {
-        if matches!(port.port_type, SerialPortType::UsbPort(_)) {
+    // Fallback: a single lone USB port when the heuristic pass came up empty.
+    if matched.is_empty() {
+        let usb: Vec<&tokio_serial::SerialPortInfo> = ports
+            .iter()
+            .filter(|p| matches!(p.port_type, SerialPortType::UsbPort(_)))
+            .collect();
+        if usb.len() == 1 {
             tracing::warn!(
-                "No known ESP port found — using first USB port: {}",
-                port.port_name
+                "No known ESP port found — using the only USB port: {}",
+                usb[0].port_name
             );
-            return Ok(port.port_name.clone());
+            matched.push(usb[0].port_name.clone());
         }
     }
 
-    let names: Vec<&str> = ports.iter().map(|p| p.port_name.as_str()).collect();
-    Err(format!(
-        "No USB serial ports detected. Available ports: [{}]",
-        names.join(", ")
-    ))
+    matched.sort();
+    matched
+}
+
+/// Derive a stable, URL-safe device id from a port path, honouring any
+/// `alias=port` overrides. Falls back to the sanitized port basename
+/// (`/dev/ttyUSB0` → `ttyUSB0`); raw paths can't be ids because `/` breaks
+/// Axum path matching.
+fn id_for_port(port_path: &str, aliases: &[(String, String)]) -> String {
+    for (alias, path) in aliases {
+        if path == port_path {
+            return alias.clone();
+        }
+    }
+    let base = port_path.rsplit('/').next().unwrap_or(port_path);
+    base.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Build a [`DeviceHandle`] for a port, wire up its channels, and spawn the
+/// per-device serial task. Returns the shared handle for registry insertion.
+pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandle> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(64);
+    let (csi_tx, _) = broadcast::channel::<Vec<u8>>(256);
+    let (log_mode_tx, log_mode_rx) = watch::channel(LogMode::default());
+    let (output_mode_tx, output_mode_rx) = watch::channel(OutputMode::default());
+    let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
+    let (info_request_tx, info_request_rx) = mpsc::channel::<InfoResponder>(4);
+
+    let dev = Arc::new(DeviceHandle {
+        id,
+        port_path,
+        baud_rate: baud,
+        serial_connected: AtomicBool::new(false),
+        collection_running: AtomicBool::new(false),
+        firmware_verified: AtomicBool::new(false),
+        cmd_tx,
+        csi_tx,
+        log_mode_tx,
+        output_mode_tx,
+        session_file_tx,
+        info_request_tx,
+        config: tokio::sync::Mutex::new(DeviceConfig::default()),
+        device_info: tokio::sync::Mutex::new(None),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    });
+
+    tokio::spawn(run_serial_task(
+        dev.clone(),
+        cmd_rx,
+        log_mode_rx,
+        output_mode_rx,
+        session_file_rx,
+        info_request_rx,
+    ));
+
+    dev
+}
+
+/// Hotplug supervisor: the single authority on which devices exist.
+///
+/// Polls the live port set on `scan_interval`, registering newly appeared
+/// devices and tearing down ones that have been absent for `DEBOUNCE`
+/// consecutive scans (the debounce absorbs transient USB drops, which the
+/// per-device reconnect loop handles on its own). Alias-pinned ports are
+/// honoured even if they don't match the ESP heuristics, as long as the OS
+/// currently lists them.
+pub async fn run_supervisor(
+    registry: Arc<DeviceRegistry>,
+    baud: u32,
+    scan_interval: Duration,
+    aliases: Vec<(String, String)>,
+) {
+    /// Consecutive missing scans before a device is removed.
+    const DEBOUNCE: u32 = 3;
+
+    let mut missing: HashMap<String, u32> = HashMap::new();
+
+    loop {
+        // Candidate (id, path) pairs present on the system right now.
+        let mut candidates: Vec<(String, String)> = detect_esp_ports()
+            .into_iter()
+            .map(|path| (id_for_port(&path, &aliases), path))
+            .collect();
+
+        // Honour alias-pinned ports the heuristics missed, if they exist.
+        let existing: HashSet<String> = tokio_serial::available_ports()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.port_name)
+            .collect();
+        for (alias, path) in &aliases {
+            if existing.contains(path) && !candidates.iter().any(|(_, p)| p == path) {
+                candidates.push((alias.clone(), path.clone()));
+            }
+        }
+
+        let present_paths: HashSet<&str> = candidates.iter().map(|(_, p)| p.as_str()).collect();
+
+        // ── Add newly appeared devices ────────────────────────────────────
+        for (id, path) in &candidates {
+            missing.remove(id);
+            if !registry.contains(id) {
+                tracing::info!("Device added: {id} ({path})");
+                registry.insert(spawn_device(id.clone(), path.clone(), baud));
+            }
+        }
+
+        // ── Tear down devices absent past the debounce window ─────────────
+        for dev in registry.snapshot() {
+            if present_paths.contains(dev.port_path.as_str()) {
+                missing.remove(&dev.id);
+                continue;
+            }
+            let count = missing.entry(dev.id.clone()).or_insert(0);
+            *count += 1;
+            if *count >= DEBOUNCE {
+                tracing::info!("Device removed: {} ({})", dev.id, dev.port_path);
+                dev.shutdown.cancel();
+                registry.remove(&dev.id);
+                missing.remove(&dev.id);
+            }
+        }
+
+        sleep(scan_interval).await;
+    }
 }
 
 /// Background task: owns the serial port for its lifetime.
@@ -122,40 +252,32 @@ pub fn detect_esp_port() -> Result<String, String> {
 /// - Does NOT set a log mode on startup — call `POST /api/config/log-mode` to
 ///   configure the device before collecting data.
 pub async fn run_serial_task(
-    initial_port_path: String,
-    baud: u32,
+    dev: Arc<DeviceHandle>,
     mut cmd_rx: mpsc::Receiver<String>,
-    csi_tx: broadcast::Sender<Vec<u8>>,
     mut log_mode_rx: watch::Receiver<LogMode>,
     mut output_mode_rx: watch::Receiver<OutputMode>,
     mut session_file_rx: watch::Receiver<Option<String>>,
     mut info_request_rx: mpsc::Receiver<InfoResponder>,
-    serial_connected: Arc<AtomicBool>,
-    collection_running: Arc<AtomicBool>,
-    firmware_verified: Arc<AtomicBool>,
-    device_info: Arc<Mutex<Option<DeviceInfo>>>,
-    shared_port_path: Arc<Mutex<String>>,
 ) {
-    let mut port_path = initial_port_path;
+    let port_path = dev.port_path.clone();
+    let baud = dev.baud_rate;
     const RECONNECT_DELAY: Duration = Duration::from_millis(800);
 
     loop {
-        {
-            let mut lock = shared_port_path.lock().await;
-            *lock = port_path.clone();
+        if dev.shutdown.is_cancelled() {
+            break;
         }
 
         let mut stream = match tokio_serial::new(&port_path, baud).open_native_async() {
             Ok(s) => s,
             Err(e) => {
-                serial_connected.store(false, Ordering::SeqCst);
-                collection_running.store(false, Ordering::SeqCst);
+                dev.serial_connected.store(false, Ordering::SeqCst);
+                dev.collection_running.store(false, Ordering::SeqCst);
                 tracing::warn!("Failed to open serial port {port_path}: {e}. Retrying...");
-                sleep(RECONNECT_DELAY).await;
-                if let Ok(new_path) = detect_esp_port() {
-                    port_path = new_path;
+                tokio::select! {
+                    _ = sleep(RECONNECT_DELAY) => continue,
+                    _ = dev.shutdown.cancelled() => break,
                 }
-                continue;
             }
         };
 
@@ -179,41 +301,43 @@ pub async fn run_serial_task(
             }
         }
 
-        serial_connected.store(true, Ordering::SeqCst);
+        dev.serial_connected.store(true, Ordering::SeqCst);
         tracing::info!("Opened serial port {port_path} @ {baud} baud");
 
         let exit = run_serial_connection(
-            &port_path,
+            &dev,
             stream,
             &mut cmd_rx,
-            &csi_tx,
             &mut log_mode_rx,
             &mut output_mode_rx,
             &mut session_file_rx,
             &mut info_request_rx,
-            &collection_running,
-            &firmware_verified,
-            &device_info,
         )
         .await;
 
-        serial_connected.store(false, Ordering::SeqCst);
-        collection_running.store(false, Ordering::SeqCst);
+        dev.serial_connected.store(false, Ordering::SeqCst);
+        dev.collection_running.store(false, Ordering::SeqCst);
         // Disconnect invalidates the firmware identity — a different chip
         // may be re-attached on reconnect, so force a fresh verification.
-        firmware_verified.store(false, Ordering::SeqCst);
-        *device_info.lock().await = None;
+        dev.firmware_verified.store(false, Ordering::SeqCst);
+        *dev.device_info.lock().await = None;
 
         match exit {
             ConnectionExit::Disconnected => {
-                tracing::warn!("ESP32 disconnected; waiting for reconnect...");
-                sleep(RECONNECT_DELAY).await;
-                if let Ok(new_path) = detect_esp_port() {
-                    port_path = new_path;
+                // Pinned to dev.port_path — retry the SAME port, never re-detect
+                // (re-detecting would let two device tasks race for one port).
+                tracing::warn!("ESP32 disconnected on {port_path}; waiting for reconnect...");
+                tokio::select! {
+                    _ = sleep(RECONNECT_DELAY) => {}
+                    _ = dev.shutdown.cancelled() => break,
                 }
             }
             ConnectionExit::CommandChannelClosed => {
-                tracing::info!("Command channel closed — shutting down serial task");
+                tracing::info!("Command channel closed — shutting down serial task ({port_path})");
+                break;
+            }
+            ConnectionExit::Shutdown => {
+                tracing::info!("Device unplugged — shutting down serial task ({port_path})");
                 break;
             }
         }
@@ -223,21 +347,23 @@ pub async fn run_serial_task(
 enum ConnectionExit {
     Disconnected,
     CommandChannelClosed,
+    Shutdown,
 }
 
 async fn run_serial_connection(
-    port_path: &str,
+    dev: &DeviceHandle,
     stream: tokio_serial::SerialStream,
     cmd_rx: &mut mpsc::Receiver<String>,
-    csi_tx: &broadcast::Sender<Vec<u8>>,
     log_mode_rx: &mut watch::Receiver<LogMode>,
     output_mode_rx: &mut watch::Receiver<OutputMode>,
     session_file_rx: &mut watch::Receiver<Option<String>>,
     info_request_rx: &mut mpsc::Receiver<InfoResponder>,
-    collection_running: &Arc<AtomicBool>,
-    firmware_verified: &Arc<AtomicBool>,
-    device_info: &Arc<Mutex<Option<DeviceInfo>>>,
 ) -> ConnectionExit {
+    let port_path = dev.port_path.as_str();
+    let csi_tx = &dev.csi_tx;
+    let collection_running = &dev.collection_running;
+    let firmware_verified = &dev.firmware_verified;
+    let device_info = &dev.device_info;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
@@ -327,6 +453,10 @@ async fn run_serial_connection(
         };
 
         tokio::select! {
+            _ = dev.shutdown.cancelled() => {
+                return ConnectionExit::Shutdown;
+            }
+
             result = reader.read_until(delimiter, &mut buf) => {
                 match result {
                     Ok(0) => {

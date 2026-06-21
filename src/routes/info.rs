@@ -4,14 +4,14 @@
 //! magic block as JSON. It exists primarily so a host can verify whether the
 //! attached ESP is actually running `esp-csi-cli-rs`, and which build of it.
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, http::StatusCode};
 use std::sync::atomic::Ordering;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
 use crate::{
     models::{ApiResponse, DeviceInfo},
-    state::AppState,
+    routes::Device,
 };
 
 /// Slightly longer than the serial-side info timeout to allow for the
@@ -38,8 +38,8 @@ pub enum InfoResult {
 ///   `esp-csi-cli-rs` (or it's a build that predates the `info` command).
 /// - `502 Bad Gateway`     — the device responded with garbled output that
 ///   could not be parsed.
-pub async fn get_info(State(state): State<AppState>) -> (StatusCode, Json<InfoResult>) {
-    if !state.serial_connected.load(Ordering::SeqCst) {
+pub async fn get_info(Device(dev): Device) -> (StatusCode, Json<InfoResult>) {
+    if !dev.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(InfoResult::Err(ApiResponse {
@@ -49,7 +49,7 @@ pub async fn get_info(State(state): State<AppState>) -> (StatusCode, Json<InfoRe
         );
     }
 
-    if state.collection_running.load(Ordering::SeqCst) {
+    if dev.collection_running.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(InfoResult::Err(ApiResponse {
@@ -60,7 +60,7 @@ pub async fn get_info(State(state): State<AppState>) -> (StatusCode, Json<InfoRe
     }
 
     let (resp_tx, resp_rx) = oneshot::channel();
-    if state.info_request_tx.send(resp_tx).await.is_err() {
+    if dev.info_request_tx.send(resp_tx).await.is_err() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(InfoResult::Err(ApiResponse {

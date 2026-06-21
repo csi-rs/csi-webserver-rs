@@ -2,13 +2,16 @@
 
 `csi-webserver` is a host-side HTTP and WebSocket service for ESP32 CSI capture.
 It receives CSI frames over USB serial and forwards them to WebSocket clients,
-dump files, or both.
+dump files, or both. It supports **multiple devices at once** — a hotplug
+supervisor discovers attached boards, and every endpoint is scoped to a device
+id under `/api/devices/{id}/...`.
 
 ## Documentation map
 
 - Repository guide: this file
 - Crates.io package document: [CRATES.md](CRATES.md)
 - HTTP API reference: [API.md](API.md)
+- Multi-device migration guide (breaking changes + client integration): [MIGRATION.md](MIGRATION.md)
 - Rust API docs: <https://docs.rs/csi-webserver>
 
 ## API reference
@@ -45,6 +48,17 @@ cargo run -- --interface 127.0.0.1 --port 3000 --baud-rate 921600
 The baud rate also accepts `CSI_BAUD_RATE` as an environment-variable
 fallback when `--baud-rate` is omitted.
 
+Pin stable device ids to specific ports with repeatable `--device` flags, and
+tune how often the supervisor rescans for plugged/unplugged boards:
+
+```bash
+cargo run -- --device lab1=/dev/ttyUSB0 --device lab2=/dev/ttyUSB1 \
+  --scan-interval-ms 1000
+```
+
+Without a `--device` override, a device's id is its sanitized port basename
+(e.g. `/dev/ttyUSB0` → `ttyUSB0`).
+
 ## Install as a binary
 
 ```bash
@@ -58,28 +72,31 @@ csi-webserver --help
 # 1) Start service
 csi-webserver
 
-# 2) Verify the device is running esp-csi-cli-rs
-curl -sS "http://127.0.0.1:3000/api/info"
+# 2) Discover attached devices and pick an id (e.g. "ttyUSB0")
+curl -sS "http://127.0.0.1:3000/api/devices"
 
-# 3) Configure log parser mode
-curl -sS -X POST "http://127.0.0.1:3000/api/config/log-mode" \
+# 3) Verify the device is running esp-csi-cli-rs
+curl -sS "http://127.0.0.1:3000/api/devices/ttyUSB0/info"
+
+# 4) Configure log parser mode
+curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/config/log-mode" \
   -H "Content-Type: application/json" \
   -d '{"mode":"array-list"}'
 
-# 4) Start an indefinite collection
-curl -sS -X POST "http://127.0.0.1:3000/api/control/start"
+# 5) Start an indefinite collection
+curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/control/start"
 
-# 5) Check status
-curl -sS "http://127.0.0.1:3000/api/control/status"
+# 6) Check status
+curl -sS "http://127.0.0.1:3000/api/devices/ttyUSB0/control/status"
 
-# 6) Stop the collection
-curl -sS -X POST "http://127.0.0.1:3000/api/control/stop"
+# 7) Stop the collection
+curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/control/stop"
 ```
 
-Pass `{"duration": <secs>}` to `/api/control/start` for a timed run that
-stops on its own.
+Pass `{"duration": <secs>}` to `/api/devices/{id}/control/start` for a timed run
+that stops on its own.
 
-WebSocket endpoint: `ws://127.0.0.1:3000/api/ws`
+WebSocket endpoint: `ws://127.0.0.1:3000/api/devices/{id}/ws`
 
 ## Output modes
 
@@ -89,13 +106,13 @@ WebSocket endpoint: `ws://127.0.0.1:3000/api/ws`
 | `dump` | no | yes |
 | `both` | yes | yes |
 
-Switch at runtime with `POST /api/config/output-mode`.
+Switch at runtime with `POST /api/devices/{id}/config/output-mode`.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CSI_SERIAL_PORT` | auto-detect | Override serial port path |
+| `CSI_SERIAL_PORT` | auto-detect | Pin a single serial port (disables multi-device discovery) |
 | `CSI_BAUD_RATE` | `115200` | Override serial baud rate (also `--baud-rate`) |
 | `RUST_LOG` | `csi_webserver=debug` | Tracing log filter |
 

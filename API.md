@@ -10,6 +10,63 @@ CLI. Each `set-*` endpoint forwards a corresponding command to the firmware
 over USB serial. Most settings are snapshotted by the firmware on the next
 `start`; a few (`log-mode`, `csi-delivery`) take effect immediately.
 
+## Device addressing
+
+The server supports **multiple ESP32 devices at once**. A hotplug supervisor
+scans for attached boards (default every 2 s, `--scan-interval-ms`), assigns
+each a stable **device id**, spawns a dedicated serial worker, and tears it down
+when the board is unplugged (after a short debounce). The server starts and
+serves even when no device is attached.
+
+- **Per-device endpoints** live under `/api/devices/{id}/...` — replace `{id}`
+  with a real device id. Every endpoint below is documented with the `{id}`
+  placeholder.
+- **The device id** defaults to the sanitized port basename (e.g. `/dev/ttyUSB0`
+  → `ttyUSB0`). Pin a stable alias with `--device <alias>=<port>` (repeatable),
+  e.g. `--device lab1=/dev/ttyUSB0` makes the id `lab1`.
+- **List devices** with [`GET /api/devices`](#get-apidevices) to discover the
+  current ids and their connection / firmware status.
+- An unknown `{id}` returns **`404 Not Found`** with the standard response shape.
+- State is **per device**: connection, firmware verification, collection
+  status, config cache, and the CSI stream are all independent. Starting a
+  collection on one device does not affect another, and each device's
+  WebSocket carries only its own frames.
+
+## Devices
+
+### `GET /api/devices`
+
+List all currently attached devices and their runtime status. Always reachable
+(does not require firmware verification). The set reflects the live hotplug
+state, so newly plugged-in boards appear within one scan interval and unplugged
+ones drop off after the debounce window.
+
+Example response body:
+
+```json
+[
+  {
+    "id": "ttyUSB0",
+    "port_path": "/dev/ttyUSB0",
+    "baud_rate": 115200,
+    "serial_connected": true,
+    "collection_running": false,
+    "firmware_verified": true,
+    "device_info": {
+      "banner_version": "0.5.0",
+      "name": "esp-csi-cli-rs",
+      "version": "0.5.0",
+      "chip": "esp32c6",
+      "protocol": 1,
+      "features": ["statistics"]
+    }
+  }
+]
+```
+
+`device_info` is `null` until the firmware identity has been verified for that
+device (see [Firmware gate](#firmware-gate)).
+
 ## Firmware gate
 
 Before the server will dispatch *any* CLI command to the device, the
@@ -19,10 +76,10 @@ this:
 - On every successful serial connect (and after the auto-RTS reset that
   follows), the server runs an internal `info` exchange. If the
   `ESP-CSI-CLI/<version>` magic prefix and `END-INFO` sentinel are observed,
-  the firmware is marked verified and the parsed [`DeviceInfo`](#get-apiinfo)
+  the firmware is marked verified and the parsed [`DeviceInfo`](#get-apidevicesidinfo)
   is cached.
-- A successful `GET /api/info` call refreshes the cached identity.
-- `POST /api/control/reset` *invalidates* the cached identity, pulses RTS,
+- A successful `GET /api/devices/{id}/info` call refreshes the cached identity.
+- `POST /api/devices/{id}/control/reset` *invalidates* the cached identity, pulses RTS,
   waits for the chip to boot, and re-runs the `info` exchange. The HTTP
   response includes whether re-verification succeeded.
 - A USB disconnect clears the verified state — a different chip may be
@@ -30,14 +87,15 @@ this:
 
 While the firmware is **not** verified, every command-dispatching endpoint
 returns **`412 Precondition Failed`** with a message pointing at
-`GET /api/info` and `POST /api/control/reset` as recovery paths. The
+`GET /api/devices/{id}/info` and `POST /api/devices/{id}/control/reset` as recovery paths. The
 exceptions — endpoints that are *always* reachable — are:
 
 - `GET /` — health
-- `GET /api/info` — the verification mechanism itself
-- `GET /api/config` — read-only cache
-- `GET /api/control/status` — read-only runtime status
-- `POST /api/control/reset` — recovery path (clears + re-verifies)
+- `GET /api/devices` — device listing
+- `GET /api/devices/{id}/info` — the verification mechanism itself
+- `GET /api/devices/{id}/config` — read-only cache
+- `GET /api/devices/{id}/control/status` — read-only runtime status
+- `POST /api/devices/{id}/control/reset` — recovery path (clears + re-verifies)
 
 ## Response shape
 
@@ -67,7 +125,7 @@ CSI Server Active
 
 ## Firmware identification
 
-### `GET /api/info`
+### `GET /api/devices/{id}/info`
 
 Verify whether the attached ESP is running `esp-csi-cli-rs` and learn which
 build of it. Issues the device-side `info` command, parses the magic block,
@@ -103,20 +161,20 @@ Notes:
   (`CLI_PROTOCOL_VERSION`); a host should refuse to operate against unknown
   protocol values.
 - `features` is informational — for example, the presence of `statistics`
-  means `POST /api/control/stats` is available on the device side. Treat it
+  means `POST /api/devices/{id}/control/stats` is available on the device side. Treat it
   as an unordered set.
 - This endpoint is the **only reliable way** to confirm firmware presence;
   failed `set-*` commands could otherwise be misread as transient errors.
 
 ## Config endpoints
 
-### `GET /api/config`
+### `GET /api/devices/{id}/config`
 
 Returns the server-side cached view of device configuration, structured to
 mirror the firmware's `show-config` output (`[WiFi]`, `[Collection]`,
 `[CSI Config]`). Best-effort — each field is populated when the matching
-`POST /api/config/*` endpoint succeeds, and reset to firmware defaults by
-`POST /api/config/reset`. Values may drift if the device is re-flashed or
+`POST /api/devices/{id}/config/*` endpoint succeeds, and reset to firmware defaults by
+`POST /api/devices/{id}/config/reset`. Values may drift if the device is re-flashed or
 commands are sent out-of-band.
 
 Example:
@@ -168,12 +226,12 @@ Notes:
 - `wifi`, `collection`, `csi_config` mirror the `show-config` sections.
 - `csi_config` carries both classic (ESP32 / ESP32-C3 / ESP32-S3) and HE
   (ESP32-C5 / ESP32-C6) fields. The ones applicable to the connected chip
-  are populated; the others stay `null`. Check `chip` from `GET /api/info`
+  are populated; the others stay `null`. Check `chip` from `GET /api/devices/{id}/info`
   to know which side to read.
 - The classic fields `channel_filter_enabled`, `manual_scale`, `shift`,
   `dump_ack_enabled` are **read-only on the device** — they have no
-  `POST /api/config/csi` flag, so they only become non-null after
-  `POST /api/config/reset` (which loads firmware defaults).
+  `POST /api/devices/{id}/config/csi` flag, so they only become non-null after
+  `POST /api/devices/{id}/config/reset` (which loads firmware defaults).
 - `sta_password` is intentionally **not cached**; round-tripping plaintext
   passwords through a GET endpoint would defeat the point.
 - `log_mode`, `csi_delivery_mode`, `csi_logging_enabled` are server-tracked
@@ -184,19 +242,19 @@ Notes:
 - `wifi.peer_mac` reads `"auto"` for the default magic-prefix pairing, or an
   explicit `aa:bb:cc:dd:ee:ff` once set. `wifi.ht40` is `none` / `above` /
   `below`. Both are ESP-NOW concerns.
-- After `POST /api/config/reset`, the cache is replaced with the firmware
+- After `POST /api/devices/{id}/config/reset`, the cache is replaced with the firmware
   defaults documented in the `show-config` spec (e.g.
   `wifi.mode = "sniffer"`, `wifi.peer_mac = "auto"`, `wifi.ht40 = "none"`,
   `collection.traffic_hz = 100`, `csi_config.csi_he_stbc = 2`).
 
-### `POST /api/config/reset`
+### `POST /api/devices/{id}/config/reset`
 
 Sends `reset-config` to the device and clears the server-side cache. Restores
 every device field to its compiled-in default.
 
 Request body: none.
 
-### `POST /api/config/wifi`
+### `POST /api/devices/{id}/config/wifi`
 
 Sets Wi-Fi mode and optional station / channel parameters. Forwards
 `set-wifi`.
@@ -244,9 +302,9 @@ Notes:
   - `sta_ssid` / `sta_password` — `station` mode only
   - `peer_mac` / `ht40` — `esp-now-*` only (silently ignored by the firmware
     in other modes)
-  - PHY rate (`/api/config/rate`) — `esp-now-*` only
+  - PHY rate (`/api/devices/{id}/config/rate`) — `esp-now-*` only
 
-### `POST /api/config/traffic`
+### `POST /api/devices/{id}/config/traffic`
 
 Sets traffic generation frequency. Forwards `set-traffic`.
 
@@ -260,7 +318,7 @@ Request body:
 - Values > `65535` are silently truncated by the firmware (cast to `u16`
   before being passed to the radio driver).
 
-### `POST /api/config/csi`
+### `POST /api/devices/{id}/config/csi`
 
 Sets CSI feature flags. Forwards `set-csi`. The body merges classic and HE
 options — only flags supported by the firmware's compiled-in variant take
@@ -302,7 +360,7 @@ sample evenly across both (default).
 `csi_he_stbc` and `val_scale_cfg` ranges are documented in firmware help but
 **not enforced** — out-of-range values are passed through.
 
-### `POST /api/config/collection-mode`
+### `POST /api/devices/{id}/config/collection-mode`
 
 Sets the node role. Forwards `set-collection-mode`.
 
@@ -319,7 +377,7 @@ Accepted values:
 
 Invalid values return `400 Bad Request`.
 
-### `POST /api/config/log-mode`
+### `POST /api/devices/{id}/config/log-mode`
 
 Sets the CSI packet output format on the device and updates the server's
 serial framer accordingly. Takes effect on the next received packet (no
@@ -348,7 +406,7 @@ Accepted values:
 
 Invalid mode values return `400 Bad Request`.
 
-### `POST /api/config/output-mode`
+### `POST /api/devices/{id}/config/output-mode`
 
 Switches CSI output destination at runtime.
 
@@ -360,7 +418,7 @@ Request body:
 
 Accepted values: `stream`, `dump`, `both`.
 
-| Value | WebSocket | Dump file | `/api/ws` |
+| Value | WebSocket | Dump file | `/api/devices/{id}/ws` |
 |-------|-----------|-----------|-----------|
 | `stream` | yes | no | available |
 | `dump` | no | yes | `403 Forbidden` |
@@ -368,7 +426,7 @@ Accepted values: `stream`, `dump`, `both`.
 
 The new mode applies on the next received frame.
 
-### `POST /api/config/rate`
+### `POST /api/devices/{id}/config/rate`
 
 Pin the Wi-Fi PHY rate. Forwards `set-rate`.
 
@@ -389,7 +447,7 @@ Notes:
 - Unknown rate values are caught by the firmware (no mutation), not by the
   server.
 
-### `POST /api/config/io-tasks`
+### `POST /api/devices/{id}/config/io-tasks`
 
 Toggle per-direction TX/RX Embassy tasks. Forwards `set-io-tasks`. Either or
 both fields may be set; omitted fields keep their current device-side value.
@@ -403,10 +461,10 @@ Request body:
 - `tx`, `rx` — booleans. The server translates `true → on`, `false → off`.
 - Disabling RX = "pure transmitter" — skips the Wi-Fi-callback CSI path.
 - Disabling TX = "pure receiver" — no traffic generation, regardless of
-  `/api/config/traffic`.
+  `/api/devices/{id}/config/traffic`.
 - A body with neither field returns `400 Bad Request`.
 
-### `POST /api/config/csi-delivery`
+### `POST /api/devices/{id}/config/csi-delivery`
 
 Switch the CSI delivery path and/or toggle the per-packet inline log gate at
 runtime. Forwards `set-csi-delivery`. Takes effect immediately on the
@@ -433,7 +491,7 @@ Request body:
 
 ## Control endpoints
 
-### `GET /api/control/status`
+### `GET /api/devices/{id}/control/status`
 
 Returns runtime serial and collection status.
 
@@ -447,7 +505,7 @@ Example:
 }
 ```
 
-### `POST /api/control/start`
+### `POST /api/devices/{id}/control/start`
 
 Starts a collection session. Forwards `start`.
 
@@ -460,10 +518,10 @@ Request body is optional:
 - `duration` — `u64` seconds. Omit for indefinite collection.
 - If a collection is already running, the endpoint returns `503 Service Unavailable`.
 - A new session dump filename is generated for each start request.
-- Stop conditions: timed run elapsing, `POST /api/control/stop`, or
-  `POST /api/control/reset`.
+- Stop conditions: timed run elapsing, `POST /api/devices/{id}/control/stop`, or
+  `POST /api/devices/{id}/control/reset`.
 
-### `POST /api/control/stop`
+### `POST /api/devices/{id}/control/stop`
 
 Gracefully stops an in-progress collection without resetting the device.
 
@@ -476,10 +534,10 @@ Notes:
   so this is the only way to stop without a hard reset.
 - Returns `200 OK` with `"Collection not running"` when no session is active.
 - Closes the active session dump file immediately.
-- Use `POST /api/control/reset` instead when you also need to hard-reset the
+- Use `POST /api/devices/{id}/control/reset` instead when you also need to hard-reset the
   chip (e.g. to recover from a wedged radio).
 
-### `POST /api/control/reset`
+### `POST /api/devices/{id}/control/reset`
 
 Resets the ESP32 by pulsing RTS (EN low, then release), then re-verifies
 that the firmware is `esp-csi-cli-rs`. The cached firmware identity is
@@ -505,12 +563,12 @@ outcome:
   device is not running `esp-csi-cli-rs` (or an older build without `info`).
   Command endpoints will keep returning `412 Precondition Failed`.
 - `"…post-reset re-verification timed out…"` — no `END-INFO` block within
-  the timeout. Try `GET /api/info` again later.
+  the timeout. Try `GET /api/devices/{id}/info` again later.
 
 Returns `500 Internal Server Error` if the adapter or board wiring does
 not support RTS reset (verification is not attempted in that case).
 
-### `POST /api/control/stats`
+### `POST /api/devices/{id}/control/stats`
 
 Triggers `show-stats` on the device. Requires the firmware to be built with
 the `statistics` feature (default-on).
@@ -520,14 +578,14 @@ Request body: none.
 Notes:
 
 - The actual counter snapshot is printed by the firmware over the same UART
-  used for CSI output, so it appears in the stream consumed by `/api/ws` (or
+  used for CSI output, so it appears in the stream consumed by `/api/devices/{id}/ws` (or
   the dump file). The HTTP response only acknowledges that the command was
   delivered.
 - Counters reset on each new `start` collection.
 
 ## WebSocket endpoint
 
-### `GET /api/ws`
+### `GET /api/devices/{id}/ws`
 
 Upgrades to a WebSocket and streams raw CSI frames as binary messages.
 
@@ -536,11 +594,13 @@ Notes:
 - Returns `403 Forbidden` when output mode is `dump`.
 - Each message is one unmodified serial frame.
 - Slow clients may drop frames but remain connected.
+- The stream carries only this device's frames. If the device is unplugged, the
+  server sends a WebSocket Close frame and the socket is closed.
 
 JavaScript example:
 
 ```js
-const ws = new WebSocket("ws://127.0.0.1:3000/api/ws");
+const ws = new WebSocket("ws://127.0.0.1:3000/api/devices/{id}/ws");
 ws.binaryType = "arraybuffer";
 ws.onmessage = (event) => {
   const frame = new Uint8Array(event.data);
@@ -561,6 +621,7 @@ Serialized frame layout:
 u32 little-endian length (4 bytes) + frame bytes (N bytes)
 ```
 
-A new dump file is created per session, using:
+A new dump file is created per session, named with the device id so concurrent
+devices never collide:
 
-- `csi_dump_YYYYMMDD_HHmmss.bin`
+- `csi_dump_<id>_YYYYMMDD_HHmmss.bin` (e.g. `csi_dump_ttyUSB0_20260621_120000.bin`)

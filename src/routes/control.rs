@@ -1,6 +1,6 @@
 //! Handlers for collection control endpoints under `/api/control/*`.
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, http::StatusCode};
 use chrono::Local;
 use std::sync::atomic::Ordering;
 use tokio::sync::oneshot;
@@ -9,7 +9,7 @@ use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
 use crate::{
     models::{ApiResponse, CollectionStatusResponse, OutputMode, StartConfig},
-    state::AppState,
+    routes::Device,
 };
 
 /// Gives the chip enough time to finish bootloader + early init after the
@@ -23,15 +23,14 @@ const POST_RESET_VERIFY_TIMEOUT: Duration = Duration::from_millis(3000);
 // ─── GET /api/control/status ──────────────────────────────────────────────
 
 pub async fn get_collection_status(
-    State(state): State<AppState>,
+    Device(dev): Device,
 ) -> (StatusCode, Json<CollectionStatusResponse>) {
-    let port_path = state.port_path.lock().await.clone();
     (
         StatusCode::OK,
         Json(CollectionStatusResponse::from_state(
-            &state.serial_connected,
-            &state.collection_running,
-            port_path,
+            &dev.serial_connected,
+            &dev.collection_running,
+            dev.port_path.clone(),
         )),
     )
 }
@@ -44,19 +43,19 @@ pub async fn get_collection_status(
 /// is wired through a transistor to the chip's EN (enable/reset) pin.
 /// Opens a short-lived second file descriptor on the serial port, pulses RTS,
 /// then drops the handle immediately so the main serial task is unaffected.
-pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>) {
     // End any active session immediately so the serial task closes dump handles.
-    state.collection_running.store(false, Ordering::SeqCst);
-    let _ = state.session_file_tx.send(None);
+    dev.collection_running.store(false, Ordering::SeqCst);
+    let _ = dev.session_file_tx.send(None);
 
     // The chip is about to reboot. Whatever firmware ran a moment ago may or
     // may not be running afterwards (the user might have re-flashed the
     // device); invalidate the cached identity so command endpoints stay
     // blocked until the post-reset re-verification confirms it.
-    state.firmware_verified.store(false, Ordering::SeqCst);
-    *state.device_info.lock().await = None;
+    dev.firmware_verified.store(false, Ordering::SeqCst);
+    *dev.device_info.lock().await = None;
 
-    if !state.serial_connected.load(Ordering::SeqCst) {
+    if !dev.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse {
@@ -66,9 +65,9 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
         );
     }
 
-    let current_port = state.port_path.lock().await.clone();
+    let current_port = dev.port_path.clone();
 
-    let mut port = match tokio_serial::new(current_port.as_str(), state.baud_rate).open_native_async() {
+    let mut port = match tokio_serial::new(current_port.as_str(), dev.baud_rate).open_native_async() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -112,7 +111,7 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
     sleep(POST_RESET_BOOT_DELAY).await;
 
     let (resp_tx, resp_rx) = oneshot::channel();
-    if state.info_request_tx.send(resp_tx).await.is_err() {
+    if dev.info_request_tx.send(resp_tx).await.is_err() {
         return (
             StatusCode::OK,
             Json(ApiResponse {
@@ -169,8 +168,8 @@ pub async fn reset_esp32(State(state): State<AppState>) -> (StatusCode, Json<Api
 /// `STOP_REQUEST` on the device, which unwinds both `run_duration` and `run`.
 /// The trailing `\r\n` appended by the serial task is harmlessly discarded
 /// during collection lock.
-pub async fn stop_collection(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
-    if !state.serial_connected.load(Ordering::SeqCst) {
+pub async fn stop_collection(Device(dev): Device) -> (StatusCode, Json<ApiResponse>) {
+    if !dev.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse {
@@ -179,11 +178,11 @@ pub async fn stop_collection(State(state): State<AppState>) -> (StatusCode, Json
             }),
         );
     }
-    if let Some(blocked) = state.require_firmware() {
+    if let Some(blocked) = dev.require_firmware() {
         return blocked;
     }
 
-    if !state.collection_running.load(Ordering::SeqCst) {
+    if !dev.collection_running.load(Ordering::SeqCst) {
         return (
             StatusCode::OK,
             Json(ApiResponse {
@@ -193,10 +192,10 @@ pub async fn stop_collection(State(state): State<AppState>) -> (StatusCode, Json
         );
     }
 
-    match state.cmd_tx.send("q".to_string()).await {
+    match dev.cmd_tx.send("q".to_string()).await {
         Ok(_) => {
-            state.collection_running.store(false, Ordering::SeqCst);
-            let _ = state.session_file_tx.send(None);
+            dev.collection_running.store(false, Ordering::SeqCst);
+            let _ = dev.session_file_tx.send(None);
             (
                 StatusCode::OK,
                 Json(ApiResponse {
@@ -222,10 +221,10 @@ pub async fn stop_collection(State(state): State<AppState>) -> (StatusCode, Json
 /// { "duration": 120 }   // omit for indefinite collection
 /// ```
 pub async fn start_collection(
-    State(state): State<AppState>,
+    Device(dev): Device,
     body: Option<Json<StartConfig>>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    if !state.serial_connected.load(Ordering::SeqCst) {
+    if !dev.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse {
@@ -234,11 +233,11 @@ pub async fn start_collection(
             }),
         );
     }
-    if let Some(blocked) = state.require_firmware() {
+    if let Some(blocked) = dev.require_firmware() {
         return blocked;
     }
 
-    if state
+    if dev
         .collection_running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -256,18 +255,23 @@ pub async fn start_collection(
         .map(|Json(b)| b.to_cli_command())
         .unwrap_or_else(|| "start".to_string());
 
-    match state.cmd_tx.send(cmd.clone()).await {
+    match dev.cmd_tx.send(cmd.clone()).await {
         Ok(_) => {
-            // Generate a timestamped session dump file path and notify the
-            // serial task. The file is only opened if the output mode includes
-            // Dump; otherwise the path is remembered and used if the mode
-            // switches later during the same session.
-            let path = format!("csi_dump_{}.bin", Local::now().format("%Y%m%d_%H%M%S"));
-            let current_mode = state.output_mode_tx.borrow().clone();
+            // Generate a timestamped, per-device session dump file path and
+            // notify the serial task. The id keeps concurrent devices from
+            // colliding on one file. The file is only opened if the output
+            // mode includes Dump; otherwise the path is remembered and used if
+            // the mode switches later during the same session.
+            let path = format!(
+                "csi_dump_{}_{}.bin",
+                dev.id,
+                Local::now().format("%Y%m%d_%H%M%S")
+            );
+            let current_mode = dev.output_mode_tx.borrow().clone();
             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
                 tracing::info!("New session dump file: {path}");
             }
-            let _ = state.session_file_tx.send(Some(path));
+            let _ = dev.session_file_tx.send(Some(path));
 
             (
                 StatusCode::OK,
@@ -278,8 +282,8 @@ pub async fn start_collection(
             )
         }
         Err(e) => {
-            state.collection_running.store(false, Ordering::SeqCst);
-            let (status, message) = if !state.serial_connected.load(Ordering::SeqCst) {
+            dev.collection_running.store(false, Ordering::SeqCst);
+            let (status, message) = if !dev.serial_connected.load(Ordering::SeqCst) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "ESP32 disconnected; serial command unavailable".to_string(),

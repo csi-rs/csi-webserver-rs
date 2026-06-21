@@ -1,10 +1,6 @@
 //! Handlers for configuration endpoints under `/api/config/*`.
 
-use axum::{
-    Json,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-};
+use axum::{Json, extract::rejection::JsonRejection, http::StatusCode};
 use std::sync::atomic::Ordering;
 
 use crate::{
@@ -13,26 +9,27 @@ use crate::{
         IoTasksConfig, LogModeConfig, OutputMode, OutputModeConfig, RateConfig, TrafficConfig,
         WifiConfig,
     },
-    state::AppState,
+    routes::Device,
+    state::DeviceHandle,
 };
 
 // ─── GET /api/config ────────────────────────────────────────────────────────
 
 /// Return the server-side cached device configuration as JSON.
-pub async fn get_config(State(state): State<AppState>) -> Json<DeviceConfig> {
-    let config = state.config.lock().await;
+pub async fn get_config(Device(dev): Device) -> Json<DeviceConfig> {
+    let config = dev.config.lock().await;
     Json(config.clone())
 }
 
 // ─── POST /api/config/reset ─────────────────────────────────────────────────
 
-pub async fn reset_config(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
-    let result = send_cmd(&state, "reset-config".to_string()).await;
+pub async fn reset_config(Device(dev): Device) -> (StatusCode, Json<ApiResponse>) {
+    let result = send_cmd(&dev, "reset-config".to_string()).await;
     if result.0 == StatusCode::OK {
         // Mirror the firmware's UserConfig::new() / CsiConfig::default()
         // snapshot so the cache reflects what's actually live on the chip,
         // even before the user re-sends any `set-*` commands.
-        *state.config.lock().await = DeviceConfig::firmware_defaults();
+        *dev.config.lock().await = DeviceConfig::firmware_defaults();
     }
     result
 }
@@ -40,16 +37,16 @@ pub async fn reset_config(State(state): State<AppState>) -> (StatusCode, Json<Ap
 // ─── POST /api/config/wifi ──────────────────────────────────────────────────
 
 pub async fn set_wifi(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<WifiConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = match body.to_cli_command() {
         Ok(c) => c,
         Err(message) => return bad_request(message),
     };
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        let mut cfg = state.config.lock().await;
+        let mut cfg = dev.config.lock().await;
         cfg.wifi.mode = Some(body.mode);
         if body.channel.is_some() {
             cfg.wifi.channel = body.channel;
@@ -74,13 +71,13 @@ pub async fn set_wifi(
 // ─── POST /api/config/traffic ───────────────────────────────────────────────
 
 pub async fn set_traffic(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<TrafficConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = body.to_cli_command();
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        state.config.lock().await.collection.traffic_hz = Some(body.frequency_hz);
+        dev.config.lock().await.collection.traffic_hz = Some(body.frequency_hz);
     }
     result
 }
@@ -88,12 +85,12 @@ pub async fn set_traffic(
 // ─── POST /api/config/csi ───────────────────────────────────────────────────
 
 pub async fn set_csi(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<CsiConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    let result = send_cmd(&state, body.to_cli_command()).await;
+    let result = send_cmd(&dev, body.to_cli_command()).await;
     if result.0 == StatusCode::OK {
-        let mut cfg = state.config.lock().await;
+        let mut cfg = dev.config.lock().await;
         // Classic flags — each `disable_*=true` toggles the corresponding
         // `*_enabled` cached value to false. There is no `enable-*` flag
         // (the firmware exposes only disables); the only way to revert is
@@ -149,16 +146,16 @@ pub async fn set_csi(
 // ─── POST /api/config/collection-mode ──────────────────────────────────────
 
 pub async fn set_collection_mode(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<CollectionModeConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = match body.to_cli_command() {
         Ok(c) => c,
         Err(message) => return bad_request(message),
     };
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        state.config.lock().await.collection.mode = Some(body.mode);
+        dev.config.lock().await.collection.mode = Some(body.mode);
     }
     result
 }
@@ -173,7 +170,7 @@ pub async fn set_collection_mode(
 /// - `"serialized"`   — COBS-encoded binary frames, null-byte delimited
 /// - `"esp-csi-tool"` — Hernandez 26-column CSV
 pub async fn set_log_mode(
-    State(state): State<AppState>,
+    Device(dev): Device,
     body: Result<Json<LogModeConfig>, JsonRejection>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let body = match body {
@@ -187,12 +184,12 @@ pub async fn set_log_mode(
     };
 
     let cmd = body.to_cli_command();
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        let mut cfg = state.config.lock().await;
+        let mut cfg = dev.config.lock().await;
         cfg.log_mode = Some(body.mode.as_cli_value().to_string());
         // Notify the serial task to switch its frame delimiter immediately.
-        let _ = state.log_mode_tx.send(body.mode);
+        let _ = dev.log_mode_tx.send(body.mode);
     }
     result
 }
@@ -212,7 +209,7 @@ pub async fn set_log_mode(
 /// serial port. If no session has been started yet the dump destination will
 /// be set as soon as `POST /api/control/start` is called.
 pub async fn set_output_mode(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<OutputModeConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let mode = match body.mode.to_ascii_lowercase().as_str() {
@@ -225,7 +222,7 @@ pub async fn set_output_mode(
             ));
         }
     };
-    let _ = state.output_mode_tx.send(mode);
+    let _ = dev.output_mode_tx.send(mode);
     (
         StatusCode::OK,
         Json(ApiResponse {
@@ -240,13 +237,13 @@ pub async fn set_output_mode(
 /// Pin the Wi-Fi PHY rate (only honored by ESP-NOW central / peripheral modes
 /// on the firmware side; sniffer and station ignore it).
 pub async fn set_rate(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<RateConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = body.to_cli_command();
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        state.config.lock().await.collection.phy_rate = Some(body.rate);
+        dev.config.lock().await.collection.phy_rate = Some(body.rate);
     }
     result
 }
@@ -256,16 +253,16 @@ pub async fn set_rate(
 /// Toggle per-direction TX/RX Embassy tasks. Either or both fields may be set;
 /// omitted fields preserve the current device-side value.
 pub async fn set_io_tasks(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<IoTasksConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = match body.to_cli_command() {
         Ok(c) => c,
         Err(message) => return bad_request(message),
     };
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        let mut cfg = state.config.lock().await;
+        let mut cfg = dev.config.lock().await;
         if let Some(tx) = body.tx {
             cfg.collection.io_tx_enabled = Some(tx);
         }
@@ -282,16 +279,16 @@ pub async fn set_io_tasks(
 /// both fields may be set; omitted fields preserve the current device-side
 /// value. Takes effect immediately on the firmware (next CSI packet).
 pub async fn set_csi_delivery(
-    State(state): State<AppState>,
+    Device(dev): Device,
     Json(body): Json<CsiDeliveryConfig>,
 ) -> (StatusCode, Json<ApiResponse>) {
     let cmd = match body.to_cli_command() {
         Ok(c) => c,
         Err(message) => return bad_request(message),
     };
-    let result = send_cmd(&state, cmd).await;
+    let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
-        let mut cfg = state.config.lock().await;
+        let mut cfg = dev.config.lock().await;
         if let Some(mode) = body.mode {
             cfg.csi_delivery_mode = Some(mode);
         }
@@ -314,8 +311,8 @@ fn bad_request(message: String) -> (StatusCode, Json<ApiResponse>) {
     )
 }
 
-async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiResponse>) {
-    if !state.serial_connected.load(Ordering::SeqCst) {
+async fn send_cmd(dev: &DeviceHandle, cmd: String) -> (StatusCode, Json<ApiResponse>) {
+    if !dev.serial_connected.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse {
@@ -324,11 +321,11 @@ async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiRespons
             }),
         );
     }
-    if let Some(blocked) = state.require_firmware() {
+    if let Some(blocked) = dev.require_firmware() {
         return blocked;
     }
 
-    match state.cmd_tx.send(cmd.clone()).await {
+    match dev.cmd_tx.send(cmd.clone()).await {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse {
@@ -337,7 +334,7 @@ async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiRespons
             }),
         ),
         Err(e) => {
-            let (status, message) = if !state.serial_connected.load(Ordering::SeqCst) {
+            let (status, message) = if !dev.serial_connected.load(Ordering::SeqCst) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "ESP32 disconnected; serial command unavailable".to_string(),
@@ -363,6 +360,6 @@ async fn send_cmd(state: &AppState, cmd: String) -> (StatusCode, Json<ApiRespons
 /// over the serial UART by the firmware; on the host side it appears in the
 /// regular CSI output stream (WebSocket / dump file). Requires the firmware
 /// to be built with the `statistics` feature (default-on).
-pub async fn show_stats(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
-    send_cmd(&state, "show-stats".to_string()).await
+pub async fn show_stats(Device(dev): Device) -> (StatusCode, Json<ApiResponse>) {
+    send_cmd(&dev, "show-stats".to_string()).await
 }
