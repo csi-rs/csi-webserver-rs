@@ -77,9 +77,9 @@ Successful response (200 OK):
 
 ```json
 {
-  "banner_version": "0.4.0",
+  "banner_version": "0.5.0",
   "name": "esp-csi-cli-rs",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "chip": "esp32c6",
   "protocol": 1,
   "features": ["statistics", "println", "auto"]
@@ -126,7 +126,9 @@ Example:
   "wifi": {
     "mode": "sniffer",
     "channel": 6,
-    "sta_ssid": "MyNetwork"
+    "sta_ssid": "MyNetwork",
+    "peer_mac": "auto",
+    "ht40": "none"
   },
   "collection": {
     "mode": "collector",
@@ -179,10 +181,13 @@ Notes:
   `set-csi-delivery` and surfaced here for convenience.
 - All fields are nullable (`Option<…>`). Absent fields mean "the
   corresponding endpoint has not been hit since startup / reset-config".
+- `wifi.peer_mac` reads `"auto"` for the default magic-prefix pairing, or an
+  explicit `aa:bb:cc:dd:ee:ff` once set. `wifi.ht40` is `none` / `above` /
+  `below`. Both are ESP-NOW concerns.
 - After `POST /api/config/reset`, the cache is replaced with the firmware
   defaults documented in the `show-config` spec (e.g.
-  `wifi.mode = "sniffer"`, `collection.traffic_hz = 100`,
-  `csi_config.csi_he_stbc = 2`).
+  `wifi.mode = "sniffer"`, `wifi.peer_mac = "auto"`, `wifi.ht40 = "none"`,
+  `collection.traffic_hz = 100`, `csi_config.csi_he_stbc = 2`).
 
 ### `POST /api/config/reset`
 
@@ -200,10 +205,12 @@ Request body:
 
 ```json
 {
-  "mode": "station",
+  "mode": "esp-now-central",
   "sta_ssid": "MyNetwork",
   "sta_password": "secret",
-  "channel": 6
+  "channel": 6,
+  "peer_mac": "aa:bb:cc:dd:ee:ff",
+  "ht40": "above"
 }
 ```
 
@@ -217,6 +224,13 @@ Optional fields:
 - `sta_password` — UTF-8, ≤ 32 bytes (firmware limit)
 - `channel` — `u8`; valid Wi-Fi channels are 1–14. Ignored by `station` mode
   (the channel comes from the AP it associates with).
+- `peer_mac` — ESP-NOW peer source MAC, `aa:bb:cc:dd:ee:ff` or `aa-bb-...`
+  (case-insensitive). An **empty string** clears the filter back to automatic
+  magic-prefix pairing. A malformed value returns `400 Bad Request`. ESP-NOW
+  modes only.
+- `ht40` — forced ESP-NOW TX HT40 secondary channel: `above`, `below`,
+  `none`, or `off` (an alias for `none`). ESP-NOW modes only. Any other value
+  returns `400 Bad Request`.
 
 Notes:
 
@@ -228,6 +242,8 @@ Notes:
 - Mode-to-feature applicability:
   - `--set-channel` — sniffer / esp-now-* only
   - `sta_ssid` / `sta_password` — `station` mode only
+  - `peer_mac` / `ht40` — `esp-now-*` only (silently ignored by the firmware
+    in other modes)
   - PHY rate (`/api/config/rate`) — `esp-now-*` only
 
 ### `POST /api/config/traffic`
@@ -402,10 +418,15 @@ Request body:
 { "mode": "async", "logging": true }
 ```
 
-- `mode` — optional. One of `off`, `callback`, `async`.
+- `mode` — optional. One of `off`, `callback`, `async`, `raw`.
   - `off`      — drop user-side dispatch (inline `log_csi` may still run).
   - `callback` — dispatch synchronously to the registered hook.
   - `async`    — enqueue for the async client.
+  - `raw`      — zero-copy fast-path. Unlike the other modes this is stored as
+    a flag on the device and only takes effect on the **next `start`**; while
+    active no CSI data is delivered or logged and the `q`-key stop peek is
+    skipped (the run is duration-bound or reset-driven). `off`/`callback`/
+    `async` clear it again.
 - `logging` — optional boolean; gates the per-packet UART/JTAG inline log
   path. Independent of `mode`.
 - A body with neither field returns `400 Bad Request`.

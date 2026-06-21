@@ -57,6 +57,15 @@ pub async fn set_wifi(
         if body.sta_ssid.is_some() {
             cfg.wifi.sta_ssid = body.sta_ssid;
         }
+        if let Some(mac) = body.peer_mac {
+            // Empty clears the filter back to auto on the device; mirror that
+            // in the cache so the displayed value matches `show-config`.
+            cfg.wifi.peer_mac = Some(if mac.is_empty() { "auto".to_string() } else { mac });
+        }
+        if let Some(ht40) = body.ht40 {
+            // `off` is an alias for `none` on the device side.
+            cfg.wifi.ht40 = Some(if ht40 == "off" { "none".to_string() } else { ht40 });
+        }
         // sta_password is intentionally not cached.
     }
     result

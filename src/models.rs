@@ -45,6 +45,12 @@ pub struct WifiSection {
     pub channel: Option<u8>,
     /// `sta_ssid` — UTF-8, ≤ 32 B.
     pub sta_ssid: Option<String>,
+    /// `peer_mac` — explicit ESP-NOW source-MAC filter, or `auto` for the
+    /// default magic-prefix pairing. ESP-NOW modes only.
+    pub peer_mac: Option<String>,
+    /// `ht40_secondary` — forced ESP-NOW TX secondary channel:
+    /// `above` | `below` | `none` (HT20/legacy). ESP-NOW modes only.
+    pub ht40: Option<String>,
 }
 
 /// `[Collection]` section in `show-config`.
@@ -131,6 +137,8 @@ impl DeviceConfig {
                 mode: Some("sniffer".to_string()),
                 channel: Some(1),
                 sta_ssid: Some(String::new()),
+                peer_mac: Some("auto".to_string()),
+                ht40: Some("none".to_string()),
             },
             collection: CollectionSection {
                 mode: Some("collector".to_string()),
@@ -192,6 +200,27 @@ fn quote_cli_arg(s: &str) -> Result<String, String> {
 
 // ─── HTTP request bodies ───────────────────────────────────────────────────
 
+/// Validate an ESP-NOW peer MAC the way the firmware does: six hex octets
+/// separated by `:` or `-` (case-insensitive). An empty string is *valid* and
+/// means "clear back to auto".
+fn validate_peer_mac(mac: &str) -> Result<(), String> {
+    if mac.is_empty() {
+        return Ok(());
+    }
+    let sep = if mac.contains(':') {
+        ':'
+    } else if mac.contains('-') {
+        '-'
+    } else {
+        return Err("peer_mac must use ':' or '-' separators (aa:bb:cc:dd:ee:ff)".to_string());
+    };
+    let octets: Vec<&str> = mac.split(sep).collect();
+    if octets.len() != 6 || octets.iter().any(|o| o.len() != 2 || !o.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(format!("Invalid peer_mac '{mac}' (use aa:bb:cc:dd:ee:ff)"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WifiConfig {
     /// `station` | `sniffer` | `esp-now-central` | `esp-now-peripheral`.
@@ -199,6 +228,13 @@ pub struct WifiConfig {
     pub sta_ssid: Option<String>,
     pub sta_password: Option<String>,
     pub channel: Option<u8>,
+    /// ESP-NOW peer source MAC (`aa:bb:cc:dd:ee:ff` or `aa-bb-...`). An empty
+    /// string clears the filter back to automatic magic-prefix pairing.
+    /// ESP-NOW modes only; ignored by the firmware in other modes.
+    pub peer_mac: Option<String>,
+    /// Forced ESP-NOW TX HT40 secondary channel: `above` | `below` |
+    /// `none` | `off`. ESP-NOW modes only.
+    pub ht40: Option<String>,
 }
 
 impl WifiConfig {
@@ -237,6 +273,23 @@ impl WifiConfig {
 
         if let Some(ch) = self.channel {
             cmd.push_str(&format!(" --set-channel={ch}"));
+        }
+
+        if let Some(mac) = &self.peer_mac {
+            validate_peer_mac(mac)?;
+            // An empty value is forwarded verbatim (`--peer-mac=`) so the
+            // firmware clears the filter back to auto.
+            cmd.push_str(&format!(" --peer-mac={mac}"));
+        }
+
+        if let Some(ht40) = &self.ht40 {
+            match ht40.as_str() {
+                "above" | "below" | "none" | "off" => {}
+                other => {
+                    return Err(format!("Invalid ht40 '{other}' (use above, below, none, or off)"));
+                }
+            }
+            cmd.push_str(&format!(" --ht40={ht40}"));
         }
 
         Ok(cmd)
@@ -445,7 +498,11 @@ impl IoTasksConfig {
 /// inline log gate. Both fields are independent; either or both may be set.
 #[derive(Debug, Deserialize)]
 pub struct CsiDeliveryConfig {
-    /// `off` | `callback` | `async`.
+    /// `off` | `callback` | `async` | `raw`.
+    ///
+    /// `raw` enables the zero-copy fast-path; unlike the other modes it is
+    /// stored as a flag on the device and only takes effect on the next
+    /// `start` (no CSI data is delivered or logged in that mode).
     pub mode: Option<String>,
     /// Toggle for the per-packet UART/JTAG inline log path.
     pub logging: Option<bool>,
@@ -459,10 +516,10 @@ impl CsiDeliveryConfig {
         let mut cmd = "set-csi-delivery".to_string();
         if let Some(mode) = &self.mode {
             match mode.as_str() {
-                "off" | "callback" | "async" => {}
+                "off" | "callback" | "async" | "raw" => {}
                 other => {
                     return Err(format!(
-                        "Unknown csi-delivery mode '{other}'; expected off, callback, or async"
+                        "Unknown csi-delivery mode '{other}'; expected off, callback, async, or raw"
                     ));
                 }
             }
@@ -552,5 +609,75 @@ impl CollectionStatusResponse {
             collection_running: collection_running.load(Ordering::SeqCst),
             port_path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wifi(mode: &str, peer_mac: Option<&str>, ht40: Option<&str>) -> WifiConfig {
+        WifiConfig {
+            mode: mode.to_string(),
+            sta_ssid: None,
+            sta_password: None,
+            channel: None,
+            peer_mac: peer_mac.map(str::to_string),
+            ht40: ht40.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn wifi_emits_peer_mac_and_ht40() {
+        let cmd = wifi("esp-now-central", Some("AA:BB:CC:DD:EE:FF"), Some("above"))
+            .to_cli_command()
+            .unwrap();
+        assert_eq!(
+            cmd,
+            "set-wifi --mode=esp-now-central --peer-mac=AA:BB:CC:DD:EE:FF --ht40=above"
+        );
+    }
+
+    #[test]
+    fn wifi_empty_peer_mac_clears_to_auto() {
+        let cmd = wifi("esp-now-peripheral", Some(""), None)
+            .to_cli_command()
+            .unwrap();
+        assert_eq!(cmd, "set-wifi --mode=esp-now-peripheral --peer-mac=");
+    }
+
+    #[test]
+    fn wifi_rejects_malformed_peer_mac() {
+        assert!(wifi("esp-now-central", Some("not-a-mac"), None)
+            .to_cli_command()
+            .is_err());
+    }
+
+    #[test]
+    fn wifi_rejects_bad_ht40() {
+        assert!(wifi("esp-now-central", None, Some("sideways"))
+            .to_cli_command()
+            .is_err());
+    }
+
+    #[test]
+    fn csi_delivery_accepts_raw() {
+        let cmd = CsiDeliveryConfig {
+            mode: Some("raw".to_string()),
+            logging: None,
+        }
+        .to_cli_command()
+        .unwrap();
+        assert_eq!(cmd, "set-csi-delivery --mode=raw");
+    }
+
+    #[test]
+    fn csi_delivery_rejects_unknown_mode() {
+        assert!(CsiDeliveryConfig {
+            mode: Some("bogus".to_string()),
+            logging: None,
+        }
+        .to_cli_command()
+        .is_err());
     }
 }
