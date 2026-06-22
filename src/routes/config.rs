@@ -1,12 +1,12 @@
 //! Handlers for configuration endpoints under `/api/config/*`.
 
-use axum::{Json, extract::rejection::JsonRejection, http::StatusCode};
+use axum::{Json, http::StatusCode};
 use std::sync::atomic::Ordering;
 
 use crate::{
     models::{
         ApiResponse, CollectionModeConfig, CsiConfig, CsiDeliveryConfig, DeviceConfig,
-        IoTasksConfig, LogModeConfig, OutputMode, OutputModeConfig, RateConfig, TrafficConfig,
+        IoTasksConfig, OutputMode, OutputModeConfig, RateConfig, TrafficConfig,
         WifiConfig,
     },
     routes::Device,
@@ -156,40 +156,6 @@ pub async fn set_collection_mode(
     let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
         dev.config.lock().await.collection.mode = Some(body.mode);
-    }
-    result
-}
-
-// ─── POST /api/config/log-mode ─────────────────────────────────────────────
-
-/// Set the log mode on the device and update the serial task's frame delimiter.
-///
-/// Supported modes (validated by request deserialization):
-/// - `"text"`         — human-readable multiline packet output
-/// - `"array-list"`   — compact one-line text output per packet
-/// - `"serialized"`   — COBS-encoded binary frames, null-byte delimited
-/// - `"esp-csi-tool"` — Hernandez 26-column CSV
-pub async fn set_log_mode(
-    Device(dev): Device,
-    body: Result<Json<LogModeConfig>, JsonRejection>,
-) -> (StatusCode, Json<ApiResponse>) {
-    let body = match body {
-        Ok(Json(body)) => body,
-        Err(_) => {
-            return bad_request(
-                "Invalid log mode. Use one of: text, array-list, serialized, esp-csi-tool"
-                    .to_string(),
-            );
-        }
-    };
-
-    let cmd = body.to_cli_command();
-    let result = send_cmd(&dev, cmd).await;
-    if result.0 == StatusCode::OK {
-        let mut cfg = dev.config.lock().await;
-        cfg.log_mode = Some(body.mode.as_cli_value().to_string());
-        // Notify the serial task to switch its frame delimiter immediately.
-        let _ = dev.log_mode_tx.send(body.mode);
     }
     result
 }

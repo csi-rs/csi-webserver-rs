@@ -5,10 +5,12 @@ Base URL examples:
 - `http://127.0.0.1:3000`
 - `http://<host>:<port>`
 
-This server is a thin HTTP/WebSocket bridge over the `esp-csi-cli-rs` on-device
-CLI. Each `set-*` endpoint forwards a corresponding command to the firmware
-over USB serial. Most settings are snapshotted by the firmware on the next
-`start`; a few (`log-mode`, `csi-delivery`) take effect immediately.
+This server bridges the `esp-csi-cli-rs` on-device CLI to HTTP/WebSocket. Each
+`set-*` endpoint forwards a corresponding command to the firmware over USB
+serial. Most settings are snapshotted by the firmware on the next `start`;
+`csi-delivery` takes effect immediately. The device is always driven in
+`serialized` mode; the server decodes frames and writes
+[Parquet dumps](#dump-file-format).
 
 ## Device addressing
 
@@ -215,7 +217,6 @@ Example:
     "csi_he_stbc": 2,
     "val_scale_cfg": 2
   },
-  "log_mode": "array-list",
   "csi_delivery_mode": "async",
   "csi_logging_enabled": true
 }
@@ -234,9 +235,9 @@ Notes:
   `POST /api/devices/{id}/config/reset` (which loads firmware defaults).
 - `sta_password` is intentionally **not cached**; round-tripping plaintext
   passwords through a GET endpoint would defeat the point.
-- `log_mode`, `csi_delivery_mode`, `csi_logging_enabled` are server-tracked
-  extras not part of `show-config` — they're set via `set-log-mode` /
-  `set-csi-delivery` and surfaced here for convenience.
+- `csi_delivery_mode`, `csi_logging_enabled` are server-tracked extras not part
+  of `show-config` — they're set via `set-csi-delivery` and surfaced here for
+  convenience. (The log mode is fixed to `serialized` and is no longer reported.)
 - All fields are nullable (`Option<…>`). Absent fields mean "the
   corresponding endpoint has not been hit since startup / reset-config".
 - `wifi.peer_mac` reads `"auto"` for the default magic-prefix pairing, or an
@@ -377,34 +378,19 @@ Accepted values:
 
 Invalid values return `400 Bad Request`.
 
-### `POST /api/devices/{id}/config/log-mode`
+### Log mode (removed)
 
-Sets the CSI packet output format on the device and updates the server's
-serial framer accordingly. Takes effect on the next received packet (no
-restart required).
+The server no longer exposes a log-mode/output-format selector. The device is
+always driven in `serialized` mode (COBS-framed postcard), the most compact and
+fastest wire format. On `start` the server issues `set-log-mode --mode=serialized`
+to the device automatically. The `text`, `array-list`, and `esp-csi-tool`
+formats are no longer supported, and `POST /api/devices/{id}/config/log-mode`
+has been removed (returns `404`).
 
-Request body:
-
-```json
-{ "mode": "array-list" }
-```
-
-Accepted values:
-
-- `text`         — verbose human-readable output with metadata
-- `array-list`   — compact one-line text output per packet (default)
-- `serialized`   — binary COBS-framed postcard output
-- `esp-csi-tool` — Hernandez 26-column CSV (compatible with the
-  ESP32-CSI-Tool collector)
-
-| Mode | Delimiter | Notes |
-|------|-----------|-------|
-| `text` | `\n` | Multiline packet assembly; waits for `csi raw data:` marker |
-| `array-list` | `\n` | One bracketed `[…]` row per packet |
-| `serialized` | `\0` | Binary COBS-framed packets |
-| `esp-csi-tool` | `\n` | One `CSI_DATA,…` CSV row per packet |
-
-Invalid mode values return `400 Bad Request`.
+The server decodes the serialized frames itself: dump files are written as
+[Parquet](#dump-file-format) (typed columns, no reverse-engineering needed),
+and the WebSocket carries the [raw serialized frames](#websocket-frame-schema)
+for clients that want to decode live.
 
 ### `POST /api/devices/{id}/config/output-mode`
 
@@ -592,7 +578,9 @@ Upgrades to a WebSocket and streams raw CSI frames as binary messages.
 Notes:
 
 - Returns `403 Forbidden` when output mode is `dump`.
-- Each message is one unmodified serial frame.
+- Each message is one unmodified serialized frame — a COBS-encoded postcard
+  record (the trailing `\0` COBS terminator is stripped). See
+  [WebSocket frame schema](#websocket-frame-schema) to decode.
 - Slow clients may drop frames but remain connected.
 - The stream carries only this device's frames. If the device is unplugged, the
   server sends a WebSocket Close frame and the socket is closed.
@@ -604,24 +592,97 @@ const ws = new WebSocket("ws://127.0.0.1:3000/api/devices/{id}/ws");
 ws.binaryType = "arraybuffer";
 ws.onmessage = (event) => {
   const frame = new Uint8Array(event.data);
-  // decode frame according to active log mode
+  // COBS-decode, then postcard-decode per the WebSocket frame schema below.
 };
 ```
 
 ## Dump file format
 
-Session dump output uses one of two layouts, based on log mode:
+Session dumps are written as **Apache Parquet** — one file per session,
+named with the device id so concurrent devices never collide:
 
-- `serialized` mode: length-prefixed binary records
-- `text`, `array-list`, `esp-csi-tool` modes: newline-terminated text packet blocks
+- `csi_dump_<id>_YYYYMMDD_HHmmss.parquet`
+  (e.g. `csi_dump_ttyUSB0_20260621_120000.parquet`)
 
-Serialized frame layout:
+The server decodes the device's serialized frames into typed columns, so the
+file is directly consumable by pandas / polars / pyarrow / DuckDB with no
+format knowledge:
 
-```text
-u32 little-endian length (4 bytes) + frame bytes (N bytes)
+```python
+import pyarrow.parquet as pq
+t = pq.read_table("csi_dump_ttyUSB0_20260621_120000.parquet")
+print(t.schema)
 ```
 
-A new dump file is created per session, named with the device id so concurrent
-devices never collide:
+### Schema
 
-- `csi_dump_<id>_YYYYMMDD_HHmmss.bin` (e.g. `csi_dump_ttyUSB0_20260621_120000.bin`)
+One **superset** schema covers all chips; columns that only exist on some chips
+are nullable and left null otherwise. Check the `chip` column (or
+`GET /api/devices/{id}/info`) to know which apply.
+
+| Column | Type | Chips | Notes |
+|--------|------|-------|-------|
+| `host_rx_time` | timestamp(µs, UTC) | all | **Server** wall-clock receive time. |
+| `chip` | string | all | Source chip (e.g. `esp32`, `esp32c6`). |
+| `mac` | string | all | Sender MAC, `aa:bb:cc:dd:ee:ff`. |
+| `rssi` | int32 | all | dBm. |
+| `timestamp` | uint32 | all | **Device** local time, microseconds since controller start. |
+| `rate` | uint32 | all | PHY rate code. |
+| `noise_floor` | int32 | all | dBm. |
+| `sig_len` | uint32 | all | Packet length incl. FCS. |
+| `rx_state` | uint32 | all | 0 = no error. |
+| `channel` | uint32 | all | Primary channel. |
+| `sequence_number` | uint16 | all | Packet sequence number. |
+| `data_format` | string | all | `RxCSIFmt` variant name (e.g. `HtBw20`). |
+| `csi_data_len` | uint16 | all | Length of `csi_data`. |
+| `csi_data` | list&lt;int8&gt; | all | Raw CSI samples (variable length, ≤ 612). |
+| `dt_year`…`dt_millisecond` | uint64 (nullable) | all | NTP calendar time, null unless the device set it. |
+| `sgi`, `secondary_channel`, `bandwidth`, `antenna`, `sig_mode`, `mcs`, `smoothing`, `not_sounding`, `aggregation`, `stbc`, `fec_coding`, `ampdu_cnt` | uint32 (nullable) | esp32 / c3 / s3 | Radio metadata; null on c5/c6. |
+| `dump_len`, `cur_bb_format`, `rx_channel_estimate_info_vld`, `rx_channel_estimate_len`, `second`, `is_group`, `rxend_state`, `rxmatch3`, `rxmatch2`, `rxmatch1` | uint32 (nullable) | c5 / c6 | Null on esp32-family. |
+| `he_sigb_len`, `cur_single_mpdu`, `rxmatch0` | uint32 (nullable) | c6 only | Null elsewhere. |
+
+`host_rx_time` is the host's wall clock; `timestamp` is the device's
+microseconds-since-boot counter — use `host_rx_time` to correlate across
+devices.
+
+### Durability
+
+The Parquet footer is written when the session ends (`stop`, output-mode switch
+to `stream`, device disconnect, or server shutdown). A hard crash/power loss
+leaves the in-progress file without a footer and any unflushed rows lost — that
+file will not open. Stop collection cleanly to finalize.
+
+## WebSocket frame schema
+
+WebSocket frames are the device's `serialized` records: `postcard`-encoded,
+COBS-framed (the server strips the trailing `\0`). To decode: COBS-decode, then
+`postcard`-decode against the on-device `CSIDataPacket` struct for the chip.
+
+- **Encoding**: [postcard](https://docs.rs/postcard) (non-self-describing,
+  varint integers) inside [COBS](https://docs.rs/cobs) framing — pinned to
+  `esp-csi-rs` **0.7.0**.
+- **Layout differs by chip.** The field set and order match `CSIDataPacket` in
+  `esp-csi-rs` 0.7.0:
+  - **esp32 / esp32c3 / esp32s3**: `mac[6], rssi:i32, timestamp:u32, rate:u32,
+    sgi:u32, secondary_channel:u32, channel:u32, bandwidth:u32, antenna:u32,
+    sig_mode:u32, mcs:u32, smoothing:u32, not_sounding:u32, aggregation:u32,
+    stbc:u32, fec_coding:u32, ampdu_cnt:u32, noise_floor:i32, rx_state:u32,
+    sig_len:u32, date_time:Option<DateTime>, sequence_number:u16,
+    data_format:RxCSIFmt, csi_data_len:u16, csi_data:Vec<i8>`.
+  - **esp32c5 / esp32c6**: `mac[6], rssi:i32, timestamp:u32, rate:u32,
+    noise_floor:i32, sig_len:u32, rx_state:u32, dump_len:u32,
+    [he_sigb_len:u32, cur_single_mpdu:u32 — c6 only], cur_bb_format:u32,
+    rx_channel_estimate_info_vld:u32, rx_channel_estimate_len:u32, second:u32,
+    channel:u32, is_group:u32, rxend_state:u32, rxmatch3:u32, rxmatch2:u32,
+    rxmatch1:u32, [rxmatch0:u32 — c6 only], date_time:Option<DateTime>,
+    sequence_number:u16, csi_data_len:u16, data_format:RxCSIFmt,
+    csi_data:Vec<i8>`.
+- `DateTime` = `{ year, month, day, hour, minute, second, millisecond }`, all `u64`.
+- `RxCSIFmt` is a `#[repr(u8)]` enum encoded as a varint of its declaration
+  index: `Bw20, HtBw20, HtBw20Stbc, SecbBw20, SecbHtBw20, SecbHtBw20Stbc,
+  SecbHtBw40, SecbHtBw40Stbc, SecaBw20, SecaHtBw20, SecaHtBw20Stbc, SecaHtBw40,
+  SecaHtBw40Stbc, Undefined`.
+
+Clients that don't want to track this layout should consume the Parquet dump
+instead (the server already does this decode). If the firmware's protocol
+version changes, update the decoder in lockstep.

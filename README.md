@@ -1,10 +1,11 @@
 # csi-webserver
 
 `csi-webserver` is a host-side HTTP and WebSocket service for ESP32 CSI capture.
-It receives CSI frames over USB serial and forwards them to WebSocket clients,
-dump files, or both. It supports **multiple devices at once** — a hotplug
-supervisor discovers attached boards, and every endpoint is scoped to a device
-id under `/api/devices/{id}/...`.
+It receives CSI frames over USB serial (always the compact `serialized`
+COBS+postcard format), streams the raw frames to WebSocket clients and/or
+decodes them into **Parquet** dump files. It supports **multiple devices at
+once** — a hotplug supervisor discovers attached boards, and every endpoint is
+scoped to a device id under `/api/devices/{id}/...`.
 
 ## Documentation map
 
@@ -78,18 +79,18 @@ curl -sS "http://127.0.0.1:3000/api/devices"
 # 3) Verify the device is running esp-csi-cli-rs
 curl -sS "http://127.0.0.1:3000/api/devices/ttyUSB0/info"
 
-# 4) Configure log parser mode
-curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/config/log-mode" \
+# 4) (Optional) write dumps to disk as well as streaming
+curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/config/output-mode" \
   -H "Content-Type: application/json" \
-  -d '{"mode":"array-list"}'
+  -d '{"mode":"both"}'
 
-# 5) Start an indefinite collection
+# 5) Start an indefinite collection (always serialized; dumps are Parquet)
 curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/control/start"
 
 # 6) Check status
 curl -sS "http://127.0.0.1:3000/api/devices/ttyUSB0/control/status"
 
-# 7) Stop the collection
+# 7) Stop the collection (finalizes the Parquet file)
 curl -sS -X POST "http://127.0.0.1:3000/api/devices/ttyUSB0/control/stop"
 ```
 

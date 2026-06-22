@@ -1,19 +1,21 @@
 //! Serial-port discovery, connection lifecycle, and frame forwarding.
 //!
 //! The serial task reconnects automatically, accepts command strings from
-//! route handlers, parses incoming frame boundaries based on log mode, then
-//! writes to dump files and/or WebSocket broadcast channels.
+//! route handlers, and splits the incoming stream into COBS frames (the wire
+//! is always the firmware's `serialized` mode). Each frame is broadcast raw to
+//! WebSocket clients and/or decoded and written to a Parquet session file.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Duration, sleep};
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialPortType};
 
-use crate::models::{DeviceConfig, DeviceInfo, LogMode, OutputMode};
+use crate::csi::{self, ChipVariant};
+use crate::models::{DeviceConfig, DeviceInfo, OutputMode};
+use crate::parquet_sink::ParquetSink;
 use crate::state::{DeviceHandle, DeviceRegistry, InfoResponder};
 
 /// Distinguishes "firmware-not-present / parse-failure" from "the link itself
@@ -167,7 +169,6 @@ fn id_for_port(port_path: &str, aliases: &[(String, String)]) -> String {
 pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>(64);
     let (csi_tx, _) = broadcast::channel::<Vec<u8>>(256);
-    let (log_mode_tx, log_mode_rx) = watch::channel(LogMode::default());
     let (output_mode_tx, output_mode_rx) = watch::channel(OutputMode::default());
     let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
     let (info_request_tx, info_request_rx) = mpsc::channel::<InfoResponder>(4);
@@ -184,7 +185,6 @@ pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandl
         firmware_verified: AtomicBool::new(false),
         cmd_tx,
         csi_tx,
-        log_mode_tx,
         output_mode_tx,
         session_file_tx,
         info_request_tx,
@@ -196,7 +196,6 @@ pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandl
     tokio::spawn(run_serial_task(
         dev.clone(),
         cmd_rx,
-        log_mode_rx,
         output_mode_rx,
         session_file_rx,
         info_request_rx,
@@ -277,17 +276,15 @@ pub async fn run_supervisor(
 /// Background task: owns the serial port for its lifetime.
 ///
 /// - Continuously reconnects if the ESP32 disconnects.
-/// - Reads incoming frames from the serial port and broadcasts the raw bytes
-///   to all WebSocket subscribers via `csi_tx`. The frame delimiter adapts to
-///   the active log mode: `\0` for serialized, `\n` for text/array-list.
+/// - Reads incoming CSI frames from the serial port. The wire format is always
+///   the firmware's `serialized` mode: COBS-framed postcard records delimited
+///   by `\0`. Each frame is broadcast verbatim to WebSocket subscribers via
+///   `csi_tx` and, when dumping, decoded and written to a Parquet session file.
 /// - Watches `cmd_rx` for outgoing CLI command strings and writes them to the
 ///   port, appending a newline.
-/// - Does NOT set a log mode on startup — call `POST /api/config/log-mode` to
-///   configure the device before collecting data.
 pub async fn run_serial_task(
     dev: Arc<DeviceHandle>,
     mut cmd_rx: mpsc::Receiver<String>,
-    mut log_mode_rx: watch::Receiver<LogMode>,
     mut output_mode_rx: watch::Receiver<OutputMode>,
     mut session_file_rx: watch::Receiver<Option<String>>,
     mut info_request_rx: mpsc::Receiver<InfoResponder>,
@@ -355,7 +352,6 @@ pub async fn run_serial_task(
             &dev,
             stream,
             &mut cmd_rx,
-            &mut log_mode_rx,
             &mut output_mode_rx,
             &mut session_file_rx,
             &mut info_request_rx,
@@ -397,11 +393,27 @@ enum ConnectionExit {
     Shutdown,
 }
 
+/// The connected chip's identity and its CSI wire layout, derived from the
+/// firmware `info` block. Only constructible for chips with a known layout.
+struct ChipInfo {
+    /// Chip string as reported by the firmware (e.g. `esp32c6`).
+    name: String,
+    /// Wire layout the Parquet decoder applies.
+    variant: ChipVariant,
+}
+
+impl ChipInfo {
+    fn from_info(info: &DeviceInfo) -> Option<Self> {
+        let name = info.chip.clone()?;
+        let variant = ChipVariant::from_chip_str(&name)?;
+        Some(ChipInfo { name, variant })
+    }
+}
+
 async fn run_serial_connection(
     dev: &DeviceHandle,
     stream: tokio_serial::SerialStream,
     cmd_rx: &mut mpsc::Receiver<String>,
-    log_mode_rx: &mut watch::Receiver<LogMode>,
     output_mode_rx: &mut watch::Receiver<OutputMode>,
     session_file_rx: &mut watch::Receiver<Option<String>>,
     info_request_rx: &mut mpsc::Receiver<InfoResponder>,
@@ -420,6 +432,11 @@ async fn run_serial_connection(
     // a moment to finish printing its boot banner, then ask `info` and
     // mirror the result into AppState. This is what makes command
     // endpoints unblock without requiring the user to call /api/info first.
+
+    // The chip identity (from the `info` block) selects the wire layout the
+    // Parquet decoder uses; refreshed on every successful info exchange.
+    let mut chip: Option<ChipInfo> = None;
+
     sleep(Duration::from_millis(700)).await;
     match do_info_exchange(&mut writer, &mut reader).await {
         Ok(info) => {
@@ -428,6 +445,7 @@ async fn run_serial_connection(
                 info.banner_version,
                 info.chip.as_deref().unwrap_or("unknown chip"),
             );
+            chip = ChipInfo::from_info(&info);
             firmware_verified.store(true, Ordering::SeqCst);
             *device_info.lock().await = Some(info);
         }
@@ -444,15 +462,18 @@ async fn run_serial_connection(
         }
     }
 
-    // ── Dump-file state (owned exclusively by this task) ──────────────────
+    // ── Output state (owned exclusively by this task) ─────────────────────
+    // The wire is always serialized (COBS-framed postcard), so framing is
+    // fixed; `drop_next_chunk` still skips the CLI echo straddling the first
+    // COBS terminator after a command/transition.
     let mut current_mode = output_mode_rx.borrow().clone();
     let mut current_session_path = session_file_rx.borrow().clone();
-    let mut current_log_mode = log_mode_rx.borrow().clone();
-    let mut drop_next_serialized_chunk = matches!(current_log_mode, LogMode::Serialized);
-    let mut dump_file: Option<tokio::fs::File> = None;
+    let mut drop_next_chunk = true;
+    let mut sink: Option<ParquetSink> = None;
+    let mut decode_errors: u64 = 0;
 
-    // Open dump file immediately if mode/session already require it.
-    sync_dump_file(&current_mode, &current_session_path, &mut dump_file).await;
+    // Open the Parquet sink immediately if mode/session already require it.
+    sync_parquet_sink(&current_mode, &current_session_path, chip.as_ref(), &mut sink);
 
     // Periodically re-attempt firmware verification if the initial auto-verify
     // above did not succeed. The first tick fires immediately, so consume it
@@ -465,7 +486,6 @@ async fn run_serial_connection(
         // ── React to runtime output-mode or session-file changes ──────────
         let mode_changed = output_mode_rx.has_changed().unwrap_or(false);
         let session_changed = session_file_rx.has_changed().unwrap_or(false);
-        let log_mode_changed = log_mode_rx.has_changed().unwrap_or(false);
 
         if mode_changed {
             current_mode = output_mode_rx.borrow_and_update().clone();
@@ -474,37 +494,20 @@ async fn run_serial_connection(
             match session_file_rx.borrow_and_update().clone() {
                 Some(path) => current_session_path = Some(path),
                 None => {
-                    dump_file = None;
+                    // Dropping the sink flushes remaining rows and writes the
+                    // Parquet footer (see ParquetSink::Drop).
+                    sink = None;
                     current_session_path = None;
-                    tracing::info!("Session ended — dump file closed");
+                    tracing::info!("Session ended — Parquet file finalized");
                 }
             }
         }
-        if log_mode_changed {
-            current_log_mode = log_mode_rx.borrow_and_update().clone();
-            // Drop partial bytes collected under the previous framing mode.
-            buf.clear();
-            // Switching into serialized mode can leave CLI echo bytes queued
-            // before the first COBS frame terminator.
-            if matches!(current_log_mode, LogMode::Serialized) {
-                drop_next_serialized_chunk = true;
-            }
-        }
         if mode_changed || session_changed {
-            sync_dump_file(&current_mode, &current_session_path, &mut dump_file).await;
+            sync_parquet_sink(&current_mode, &current_session_path, chip.as_ref(), &mut sink);
         }
 
-        // Pick the frame delimiter based on the active mode.
-        // Serialized mode is COBS-framed; text, array-list and esp-csi-tool
-        // are newline-framed.
-        let is_text_mode = matches!(current_log_mode, LogMode::Text);
-        let is_array_list_mode = matches!(current_log_mode, LogMode::ArrayList);
-        let is_esp_csi_tool_mode = matches!(current_log_mode, LogMode::EspCsiTool);
-        let delimiter = if matches!(current_log_mode, LogMode::Serialized) {
-            b'\0'
-        } else {
-            b'\n'
-        };
+        // The wire is always serialized: COBS frames terminated by `\0`.
+        const DELIMITER: u8 = b'\0';
 
         tokio::select! {
             _ = dev.shutdown.cancelled() => {
@@ -518,9 +521,8 @@ async fn run_serial_connection(
             _ = reverify.tick(), if !firmware_verified.load(Ordering::SeqCst)
                 && !collection_running.load(Ordering::SeqCst) =>
             {
-                if matches!(current_log_mode, LogMode::Serialized) {
-                    drop_next_serialized_chunk = true;
-                }
+                // The info block is text; drop the COBS chunk straddling it.
+                drop_next_chunk = true;
                 // Drop any partial frame; the info exchange runs in line-mode.
                 buf.clear();
 
@@ -531,6 +533,7 @@ async fn run_serial_connection(
                             info.banner_version,
                             info.chip.as_deref().unwrap_or("unknown chip"),
                         );
+                        chip = ChipInfo::from_info(&info);
                         firmware_verified.store(true, Ordering::SeqCst);
                         *device_info.lock().await = Some(info);
                     }
@@ -545,110 +548,58 @@ async fn run_serial_connection(
                 }
             }
 
-            result = reader.read_until(delimiter, &mut buf) => {
+            result = reader.read_until(DELIMITER, &mut buf) => {
                 match result {
                     Ok(0) => {
                         tracing::warn!("Serial port {port_path} closed (EOF)");
                         return ConnectionExit::Disconnected;
                     }
                     Ok(_) => {
-                        if matches!(current_log_mode, LogMode::Serialized) && drop_next_serialized_chunk {
-                            // Discard the first null-delimited chunk after mode/command transitions.
-                            // It may contain CLI prompt/echo lines buffered before binary frames.
-                            drop_next_serialized_chunk = false;
+                        if drop_next_chunk {
+                            // Discard the first null-delimited chunk after a
+                            // command/transition: it may hold CLI prompt/echo
+                            // text buffered before the first binary frame.
+                            drop_next_chunk = false;
                             buf.clear();
                             continue;
                         }
 
-                        if is_text_mode {
-                            // Text mode packets span multiple lines.
-                            // The final line contains the actual CSI data array.
-                            let text = String::from_utf8_lossy(&buf);
-                            if !text.contains("csi raw data:") && buf.len() < 65536 {
-                                // Keep accumulating lines for the same packet.
-                                continue;
-                            }
-
-                            // Ignore command echoes / prompts / startup lines before packet body.
-                            if let Some(start) = find_subsequence(&buf, b"mac:") {
-                                if start > 0 {
-                                    buf.drain(..start);
-                                }
-                            } else {
-                                buf.clear();
-                                continue;
-                            }
-
-                            // Strip control bytes that can appear when switching modes.
-                            buf.retain(|b| {
-                                *b == b'\n' || *b == b'\r' || *b == b'\t' || (*b >= 0x20 && *b <= 0x7E)
-                            });
-                        } else if is_array_list_mode {
-                            // Array-list mode should emit one compact bracketed row per packet.
-                            // Drop CLI echoes, prompts, and boot logs.
-                            while matches!(buf.last(), Some(b'\n' | b'\r')) {
-                                buf.pop();
-                            }
-                            if buf.first() != Some(&b'[') || buf.last() != Some(&b']') {
-                                buf.clear();
-                                continue;
-                            }
-                        } else if is_esp_csi_tool_mode {
-                            // Hernandez 26-column CSV. Each row begins with the
-                            // literal label `CSI_DATA,`; drop everything else
-                            // (CLI prompts, boot lines, echoes, headers).
-                            while matches!(buf.last(), Some(b'\n' | b'\r')) {
-                                buf.pop();
-                            }
-                            if let Some(start) = find_subsequence(&buf, b"CSI_DATA,") {
-                                if start > 0 {
-                                    buf.drain(..start);
-                                }
-                            } else {
-                                buf.clear();
-                                continue;
-                            }
-                        }
-
-                        if buf.last() == Some(&delimiter) {
-                            buf.pop();
-                        }
-                        // For multiline text mode we might also want to strip a trailing \r from the last line
-                        if is_text_mode && buf.last() == Some(&b'\r') {
+                        // Strip the trailing COBS `\0` terminator to leave just
+                        // the COBS body.
+                        if buf.last() == Some(&DELIMITER) {
                             buf.pop();
                         }
 
-                        // Keep text outputs frame-separated for dump readability.
-                        if !matches!(current_log_mode, LogMode::Serialized)
-                            && !buf.is_empty()
-                            && buf.last() != Some(&b'\n')
-                        {
-                            buf.push(b'\n');
-                        }
-
-                        // Only forward to consumers while a session is
-                        // active. After `POST /api/control/stop` flips
+                        // Only forward to consumers while a session is active.
+                        // After `POST /api/control/stop` flips
                         // `collection_running` to false, this drops any
-                        // tail-of-session bytes (in-flight CSI frames,
-                        // post-`q` boot text, command echoes) on the floor
-                        // instead of leaking them to WebSocket clients or
-                        // the dump file. The buffer still gets cleared
-                        // below, so the framer keeps draining serial
-                        // input rather than back-pressuring it.
+                        // tail-of-session bytes (in-flight CSI frames, post-`q`
+                        // boot text, command echoes) on the floor instead of
+                        // leaking them. The buffer is still cleared below so the
+                        // framer keeps draining serial input.
                         let still_collecting = collection_running.load(Ordering::SeqCst);
 
                         if still_collecting && !buf.is_empty() {
                             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
-                                if let Some(ref mut file) = dump_file {
-                                    if matches!(current_log_mode, LogMode::Serialized) {
-                                        let len = buf.len() as u32;
-                                        if let Err(e) = file.write_all(&len.to_le_bytes()).await {
-                                            tracing::error!("Dump write error (len): {e}");
-                                        } else if let Err(e) = file.write_all(&buf).await {
-                                            tracing::error!("Dump write error (data): {e}");
+                                if let (Some(sink), Some(chip)) = (sink.as_mut(), chip.as_ref()) {
+                                    match csi::decode(&buf, chip.variant) {
+                                        Ok(decoded) => {
+                                            let host_rx = chrono::Utc::now().timestamp_micros();
+                                            if let Err(e) = sink.push(decoded, host_rx) {
+                                                tracing::error!("Parquet write error: {e}");
+                                            }
                                         }
-                                    } else if let Err(e) = file.write_all(&buf).await {
-                                        tracing::error!("Dump write error (text): {e}");
+                                        Err(_) => {
+                                            decode_errors += 1;
+                                            // Log sparsely to avoid flooding on a
+                                            // persistent wire mismatch.
+                                            if decode_errors.is_power_of_two() {
+                                                tracing::warn!(
+                                                    "Failed to decode CSI frame on {port_path} ({} total); check firmware/chip wire compatibility",
+                                                    decode_errors,
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -669,11 +620,10 @@ async fn run_serial_connection(
                 match cmd {
                     Some(cmd) => {
                         tracing::debug!("→ ESP32: {cmd}");
-                        if matches!(current_log_mode, LogMode::Serialized) {
-                            // In serialized mode command echoes are text but framing is null-delimited.
-                            // Drop the next chunk to avoid mixing those echoes with binary payload.
-                            drop_next_serialized_chunk = true;
-                        }
+                        // Command echoes are text but the wire framing is
+                        // null-delimited; drop the next chunk so echoes don't
+                        // mix with binary payload.
+                        drop_next_chunk = true;
                         let line = format!("{cmd}\r\n");
                         if let Err(e) = writer.write_all(line.as_bytes()).await {
                             tracing::error!("Serial write error: {e}");
@@ -706,17 +656,16 @@ async fn run_serial_connection(
                     continue;
                 }
 
-                if matches!(current_log_mode, LogMode::Serialized) {
-                    // The info block is text — drop any partial COBS chunk
-                    // straddling our text exchange.
-                    drop_next_serialized_chunk = true;
-                }
+                // The info block is text — drop any partial COBS chunk
+                // straddling our text exchange.
+                drop_next_chunk = true;
                 // Discard any partial CSI frame the framer was accumulating;
                 // the info exchange runs in line-mode below.
                 buf.clear();
 
                 match do_info_exchange(&mut writer, &mut reader).await {
                     Ok(info) => {
+                        chip = ChipInfo::from_info(&info);
                         firmware_verified.store(true, Ordering::SeqCst);
                         *device_info.lock().await = Some(info.clone());
                         let _ = responder.send(Ok(info));
@@ -860,36 +809,44 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-async fn sync_dump_file(
+/// Reconcile the Parquet sink with the active output mode and session path.
+///
+/// Opens a sink when dumping is active and a session path is set (requires a
+/// known chip so frames can be decoded); drops the sink — finalizing the file —
+/// when switching to stream-only.
+fn sync_parquet_sink(
     mode: &OutputMode,
     session_path: &Option<String>,
-    dump_file: &mut Option<tokio::fs::File>,
+    chip: Option<&ChipInfo>,
+    sink: &mut Option<ParquetSink>,
 ) {
     match mode {
         OutputMode::Dump | OutputMode::Both => {
-            if dump_file.is_none() {
+            if sink.is_none() {
                 if let Some(path) = session_path {
-                    match OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(path)
-                        .await
-                    {
-                        Ok(f) => {
-                            tracing::info!("Opened dump file: {path}");
-                            *dump_file = Some(f);
+                    let Some(chip) = chip else {
+                        tracing::error!(
+                            "Cannot open Parquet dump {path}: chip not identified or unsupported; \
+                             frames cannot be decoded. Streaming (if enabled) is unaffected."
+                        );
+                        return;
+                    };
+                    match ParquetSink::open(path, &chip.name) {
+                        Ok(s) => {
+                            tracing::info!("Opened Parquet dump: {path} (chip {})", chip.name);
+                            *sink = Some(s);
                         }
                         Err(e) => {
-                            tracing::error!("Failed to open dump file {path}: {e}");
+                            tracing::error!("Failed to open Parquet dump {path}: {e}");
                         }
                     }
                 }
             }
         }
         OutputMode::Stream => {
-            if dump_file.take().is_some() {
-                tracing::info!("Switched to stream mode — dump file closed");
+            if sink.take().is_some() {
+                // Dropping the sink finalizes the Parquet file.
+                tracing::info!("Switched to stream mode — Parquet file finalized");
             }
         }
     }

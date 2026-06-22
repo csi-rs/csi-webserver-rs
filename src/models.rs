@@ -21,17 +21,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// echoes it — round-tripping plaintext passwords through a GET endpoint
 /// would defeat the point of having one.
 ///
-/// The trailing fields (`log_mode`, `csi_delivery_mode`,
-/// `csi_logging_enabled`) live alongside the show-config sections because
-/// they're set via separate CLI commands (`set-log-mode`, `set-csi-delivery`)
-/// and are useful to surface here even though they aren't part of the
-/// `show-config` block.
+/// The trailing fields (`csi_delivery_mode`, `csi_logging_enabled`) live
+/// alongside the show-config sections because they're set via separate CLI
+/// commands (`set-csi-delivery`) and are useful to surface here even though
+/// they aren't part of the `show-config` block.
+///
+/// The log mode is fixed to `serialized` (the only format this server
+/// consumes), so it is no longer a configurable field.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeviceConfig {
     pub wifi: WifiSection,
     pub collection: CollectionSection,
     pub csi_config: CsiConfigSection,
-    pub log_mode: Option<String>,
     pub csi_delivery_mode: Option<String>,
     pub csi_logging_enabled: Option<bool>,
 }
@@ -169,7 +170,6 @@ impl DeviceConfig {
                 csi_he_stbc: Some(2),
                 val_scale_cfg: Some(2),
             },
-            log_mode: None,
             csi_delivery_mode: None,
             csi_logging_enabled: None,
         }
@@ -398,43 +398,6 @@ impl CollectionModeConfig {
             other => Err(format!(
                 "Unknown collection mode '{other}'; expected collector or listener"
             )),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LogModeConfig {
-    pub mode: LogMode,
-}
-
-impl LogModeConfig {
-    pub fn to_cli_command(&self) -> String {
-        format!("set-log-mode --mode={}", self.mode.as_cli_value())
-    }
-}
-
-/// Supported CSI log formats exposed by `esp-csi-cli-rs set-log-mode`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LogMode {
-    /// Verbose human-readable output with metadata.
-    Text,
-    /// Compact one-line text output per packet.
-    #[default]
-    ArrayList,
-    /// Binary COBS-framed postcard output.
-    Serialized,
-    /// Hernandez-style 26-column CSV (compatible with the ESP32-CSI-Tool collector).
-    EspCsiTool,
-}
-
-impl LogMode {
-    pub fn as_cli_value(&self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::ArrayList => "array-list",
-            Self::Serialized => "serialized",
-            Self::EspCsiTool => "esp-csi-tool",
         }
     }
 }

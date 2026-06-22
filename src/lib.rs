@@ -17,9 +17,10 @@
 //! ## Typical runtime flow
 //!
 //! 1. List attached devices via `/api/devices` and pick an id.
-//! 2. Configure device and parser mode through `/api/devices/{id}/config/*`.
+//! 2. Configure the device through `/api/devices/{id}/config/*` (the CSI wire
+//!    format is fixed to `serialized`).
 //! 3. Start session via `/api/devices/{id}/control/start`.
-//! 4. Consume frames from `/api/devices/{id}/ws` or dump file output.
+//! 4. Consume raw frames from `/api/devices/{id}/ws` or read the Parquet dump.
 //! 5. Inspect runtime status via `/api/devices/{id}/control/status`.
 //!
 //! ## Public modules
@@ -29,7 +30,9 @@
 //! - [`serial`] serial I/O and framing pipeline.
 //! - [`routes`] HTTP and WebSocket route handlers.
 
+pub mod csi;
 pub mod models;
+pub mod parquet_sink;
 pub mod routes;
 pub mod serial;
 pub mod state;

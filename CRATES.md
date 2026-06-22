@@ -1,10 +1,11 @@
 # csi-webserver
 
 `csi-webserver` is a host-side HTTP and WebSocket server for ESP32 CSI collection.
-It reads CSI frames from an ESP32 over USB serial and forwards them to:
+It reads CSI frames from an ESP32 over USB serial (always the compact
+`serialized` COBS+postcard format) and forwards them to:
 
-- WebSocket clients (`/api/ws`)
-- Session dump files (`csi_dump_YYYYMMDD_HHmmss.bin`)
+- WebSocket clients (`/api/ws`) — raw serialized frames
+- Session dump files decoded to Parquet (`csi_dump_<id>_YYYYMMDD_HHmmss.parquet`)
 - Or both at the same time
 
 This crate is intended to be run as an executable service.
@@ -58,18 +59,18 @@ csi-webserver
 # 2) Verify the device is running esp-csi-cli-rs
 curl -sS "http://127.0.0.1:3000/api/info"
 
-# 3) Set log mode
-curl -sS -X POST "http://127.0.0.1:3000/api/config/log-mode" \
+# 3) (Optional) write dumps to disk as well as streaming
+curl -sS -X POST "http://127.0.0.1:3000/api/config/output-mode" \
   -H "Content-Type: application/json" \
-  -d '{"mode":"array-list"}'
+  -d '{"mode":"both"}'
 
-# 4) Start an indefinite collection session
+# 4) Start an indefinite collection session (always serialized; dumps are Parquet)
 curl -sS -X POST "http://127.0.0.1:3000/api/control/start"
 
 # 5) Read runtime status
 curl -sS "http://127.0.0.1:3000/api/control/status"
 
-# 6) Stop the collection
+# 6) Stop the collection (finalizes the Parquet file)
 curl -sS -X POST "http://127.0.0.1:3000/api/control/stop"
 ```
 

@@ -26,9 +26,10 @@ use crate::{
 /// The mode check happens before the WebSocket upgrade handshake so that any
 /// HTTP client (not just WebSocket clients) receives the 403 correctly.
 ///
-/// Each binary message sent to the client is one unmodified frame as received
-/// from the ESP32 over serial. The client is responsible for decoding based
-/// on the active log mode (e.g. array-list text or COBS binary).
+/// Each binary message sent to the client is one unmodified serialized frame
+/// as received from the ESP32 over serial — a COBS-framed postcard record
+/// (trailing `\0` stripped). The client COBS-decodes then postcard-decodes it
+/// (see the WebSocket frame schema in API.md).
 pub async fn ws_handler(Device(dev): Device, req: axum::extract::Request) -> Response {
     // Check the mode BEFORE attempting the WebSocket upgrade extraction.
     // If WebSocketUpgrade were an extractor in the function signature, Axum

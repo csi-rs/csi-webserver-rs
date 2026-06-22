@@ -43,7 +43,9 @@
 //! worker's reconnect loop; sustained absence is detected by the supervisor,
 //! which removes the device. HTTP routes return `404` for unknown device ids.
 
+mod csi;
 mod models;
+mod parquet_sink;
 mod routes;
 mod serial;
 mod state;
@@ -153,7 +155,6 @@ async fn main() {
             "/config/collection-mode",
             post(routes::config::set_collection_mode),
         )
-        .route("/config/log-mode", post(routes::config::set_log_mode))
         .route("/config/output-mode", post(routes::config::set_output_mode))
         .route("/config/rate", post(routes::config::set_rate))
         .route("/config/io-tasks", post(routes::config::set_io_tasks))

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{DeviceConfig, DeviceInfo, LogMode, OutputMode};
+use crate::models::{DeviceConfig, DeviceInfo, OutputMode};
 
 /// One-shot reply channel for an in-flight `info` exchange.
 pub type InfoResponder = oneshot::Sender<Result<DeviceInfo, String>>;
@@ -52,10 +52,9 @@ pub struct DeviceHandle {
     pub firmware_verified: AtomicBool,
     /// Send CLI command strings to the serial background task.
     pub cmd_tx: mpsc::Sender<String>,
-    /// Broadcast raw CSI frame bytes to this device's WebSocket clients.
+    /// Broadcast raw CSI frame bytes (COBS-framed postcard) to this device's
+    /// WebSocket clients.
     pub csi_tx: broadcast::Sender<Vec<u8>>,
-    /// Notify the serial task of log-mode changes (affects the frame delimiter).
-    pub log_mode_tx: watch::Sender<LogMode>,
     /// Notify the serial task of output-mode changes (stream / dump / both).
     pub output_mode_tx: watch::Sender<OutputMode>,
     /// Signal the serial task of the current session's dump file path.

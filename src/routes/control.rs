@@ -255,6 +255,16 @@ pub async fn start_collection(
         .map(|Json(b)| b.to_cli_command())
         .unwrap_or_else(|| "start".to_string());
 
+    // Force the device into `serialized` (COBS-framed postcard) mode — the only
+    // format this server consumes. The CLI is locked once collection runs, so
+    // this must precede `start`; the ordered command channel guarantees the
+    // device applies it first. Best-effort: if it fails, the `start` send below
+    // surfaces the same channel error.
+    let _ = dev
+        .cmd_tx
+        .send("set-log-mode --mode=serialized".to_string())
+        .await;
+
     match dev.cmd_tx.send(cmd.clone()).await {
         Ok(_) => {
             // Generate a timestamped, per-device session dump file path and
@@ -263,7 +273,7 @@ pub async fn start_collection(
             // mode includes Dump; otherwise the path is remembered and used if
             // the mode switches later during the same session.
             let path = format!(
-                "csi_dump_{}_{}.bin",
+                "csi_dump_{}_{}.parquet",
                 dev.id,
                 Local::now().format("%Y%m%d_%H%M%S")
             );
