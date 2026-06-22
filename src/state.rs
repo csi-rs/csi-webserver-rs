@@ -34,6 +34,12 @@ pub struct DeviceHandle {
     /// Baud rate negotiated at startup. The serial task and the RTS-reset
     /// handler both read this so a single source of truth governs the link.
     pub baud_rate: u32,
+    /// True when this port is an Espressif native USB-Serial-JTAG endpoint
+    /// (VID `0x303A`). Such chips re-enumerate their USB device when reset, so
+    /// the serial task must NOT pulse RTS/DTR on connect — doing so drops the
+    /// `/dev/ttyACMx` node (often returning under a different number) and the
+    /// pinned-path reconnect loop can then never re-verify the device.
+    pub native_usb: bool,
     /// Whether the serial task currently has an open and healthy ESP32 link.
     pub serial_connected: AtomicBool,
     /// Best-effort flag: true after successful `start`, false after reset/disconnect.

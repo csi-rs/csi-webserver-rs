@@ -51,12 +51,33 @@ const INFO_RESPONSE_TIMEOUT: Duration = Duration::from_millis(2000);
 /// full reconnect, never becoming usable to clients.
 const REVERIFY_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Espressif's USB vendor id, used by the built-in USB-Serial-JTAG controller
+/// on ESP32-S3 / C3 / C6. These chips reset by re-enumerating their USB
+/// endpoint, so the RTS/DTR auto-reset is skipped for them.
+const ESPRESSIF_NATIVE_USB_VID: u16 = 0x303A;
+
 /// Known ESP32 USB-UART adapter Vendor IDs.
 const ESP_USB_VIDS: &[u16] = &[
-    0x10C4, // Silicon Labs CP210x (most common on ESP32 devkits)
-    0x1A86, // WCH CH340 / CH341
-    0x303A, // Espressif built-in USB (ESP32-S3 / C3 / C6 native USB)
+    0x10C4,                    // Silicon Labs CP210x (most common on ESP32 devkits)
+    0x1A86,                    // WCH CH340 / CH341
+    ESPRESSIF_NATIVE_USB_VID, // Espressif built-in USB (ESP32-S3 / C3 / C6 native USB)
 ];
+
+/// True if the port at `path` is an Espressif native USB-Serial-JTAG endpoint
+/// (VID [`ESPRESSIF_NATIVE_USB_VID`]). Resolved once at device spawn so the
+/// serial task knows whether the RTS/DTR auto-reset is safe to perform.
+fn is_native_usb_port(path: &str) -> bool {
+    tokio_serial::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .any(|p| {
+            p.port_name == path
+                && matches!(
+                    p.port_type,
+                    SerialPortType::UsbPort(info) if info.vid == ESPRESSIF_NATIVE_USB_VID
+                )
+        })
+}
 
 /// Detect *all* available ESP32 USB serial port paths, sorted so device-id
 /// assignment is deterministic across scans.
@@ -151,10 +172,13 @@ pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandl
     let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
     let (info_request_tx, info_request_rx) = mpsc::channel::<InfoResponder>(4);
 
+    let native_usb = is_native_usb_port(&port_path);
+
     let dev = Arc::new(DeviceHandle {
         id,
         port_path,
         baud_rate: baud,
+        native_usb,
         serial_connected: AtomicBool::new(false),
         collection_running: AtomicBool::new(false),
         firmware_verified: AtomicBool::new(false),
@@ -298,15 +322,29 @@ pub async fn run_serial_task(
 
         // Auto-reset ESP32 right after a successful serial connection.
         // This matches the devkit EN/RTS wiring used by ESP32 USB-UART boards.
-        let _ = stream.write_data_terminal_ready(false);
-        if let Err(e) = stream.write_request_to_send(true) {
-            tracing::warn!("Failed to assert RTS on {port_path}: {e}");
+        //
+        // Skipped for native USB-Serial-JTAG chips (VID 0x303A): on those the
+        // RTS/DTR pulse reboots the USB peripheral itself, so the device
+        // re-enumerates and its `/dev/ttyACMx` node can return under a
+        // different number. The task is pinned to the original path and would
+        // then never reconnect/verify — the cause of the "second device fails
+        // to verify" failure when two such boards reset at once. These chips
+        // already answer `info` without a reset, so nothing is lost.
+        if dev.native_usb {
+            tracing::info!(
+                "Skipping RTS auto-reset on {port_path} (native USB-Serial-JTAG; reset would re-enumerate the port)"
+            );
         } else {
-            sleep(Duration::from_millis(100)).await;
-            if let Err(e) = stream.write_request_to_send(false) {
-                tracing::warn!("Failed to deassert RTS on {port_path}: {e}");
+            let _ = stream.write_data_terminal_ready(false);
+            if let Err(e) = stream.write_request_to_send(true) {
+                tracing::warn!("Failed to assert RTS on {port_path}: {e}");
             } else {
-                tracing::info!("ESP32 reset on connect via RTS ({port_path})");
+                sleep(Duration::from_millis(100)).await;
+                if let Err(e) = stream.write_request_to_send(false) {
+                    tracing::warn!("Failed to deassert RTS on {port_path}: {e}");
+                } else {
+                    tracing::info!("ESP32 reset on connect via RTS ({port_path})");
+                }
             }
         }
 
