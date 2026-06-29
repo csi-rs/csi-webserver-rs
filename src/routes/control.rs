@@ -37,12 +37,16 @@ pub async fn get_collection_status(
 
 // ─── POST /api/control/reset ───────────────────────────────────────────────
 
-/// Reset the ESP32 by pulsing the RTS line (asserting EN low for 100 ms).
+/// Reset the ESP32, then re-verify its firmware identity.
 ///
-/// Works on all standard ESP32 devkits where the USB-UART adapter's RTS pin
-/// is wired through a transistor to the chip's EN (enable/reset) pin.
-/// Opens a short-lived second file descriptor on the serial port, pulses RTS,
-/// then drops the handle immediately so the main serial task is unaffected.
+/// Two paths, chosen by adapter type:
+/// - **UART adapters (CP210x / CH340):** pulse the RTS line (EN low for 100 ms)
+///   on a short-lived second fd, then synchronously re-verify over the existing
+///   link. This matches the devkit EN/RTS auto-reset wiring.
+/// - **Native USB-Serial-JTAG (VID 0x303A):** send the firmware `restart`
+///   command instead — pulsing RTS/DTR on these re-enumerates (and can wedge)
+///   the USB device. Re-verification then happens asynchronously on reconnect,
+///   so this path returns immediately.
 pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>) {
     // End any active session immediately so the serial task closes dump handles.
     dev.collection_running.store(false, Ordering::SeqCst);
@@ -61,6 +65,40 @@ pub async fn reset_esp32(Device(dev): Device) -> (StatusCode, Json<ApiResponse>)
             Json(ApiResponse {
                 success: false,
                 message: "ESP32 disconnected; serial command unavailable".to_string(),
+            }),
+        );
+    }
+
+    // ── Native USB-Serial-JTAG: software reset over the CLI ───────────────
+    // Pulsing RTS/DTR on these chips re-enumerates the USB device (and can
+    // wedge it). Instead ask the firmware to reset itself via the `restart`
+    // command (esp_hal::system::software_reset). The chip still re-enumerates,
+    // but it always reboots cleanly into the app — and on a new `/dev/ttyACMx`
+    // the supervisor follows it by MAC. We don't drive a synchronous re-verify
+    // here because the re-enumeration may move the device onto a freshly
+    // spawned task; the auto-verify-on-(re)connect path handles it.
+    if dev.native_usb {
+        if let Err(e) = dev.cmd_tx.send("restart".to_string()).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse {
+                    success: false,
+                    message: format!("Failed to queue restart command: {e}"),
+                }),
+            );
+        }
+        tracing::info!(
+            "ESP32 restart command sent on {} (native USB-Serial-JTAG; re-verifies on reconnect)",
+            dev.port_path,
+        );
+        return (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: "ESP32 restart issued via firmware (native USB-Serial-JTAG). The device \
+                          will re-enumerate and re-verify automatically; poll GET /api/devices or \
+                          GET /api/info to confirm."
+                    .to_string(),
             }),
         );
     }

@@ -63,6 +63,9 @@ pub struct CollectionSection {
     pub traffic_hz: Option<u64>,
     /// `phy_rate` enum — e.g. `mcs0-lgi`. Only honored by ESP-NOW modes.
     pub phy_rate: Option<String>,
+    /// `protocol` — Wi-Fi PHY protocol applied at the start of each run.
+    /// One of `b` | `g` | `n` | `lr` | `a` | `ac` | `ax`; defaults to `lr`.
+    pub protocol: Option<String>,
     /// `io_tasks.tx_enabled`.
     pub io_tx_enabled: Option<bool>,
     /// `io_tasks.rx_enabled`.
@@ -145,6 +148,7 @@ impl DeviceConfig {
                 mode: Some("collector".to_string()),
                 traffic_hz: Some(100),
                 phy_rate: Some("mcs0-lgi".to_string()),
+                protocol: Some("lr".to_string()),
                 io_tx_enabled: Some(true),
                 io_rx_enabled: Some(true),
             },
@@ -432,6 +436,35 @@ impl RateConfig {
     }
 }
 
+/// `POST /api/config/protocol` — set the Wi-Fi PHY protocol applied to the node
+/// at the start of each collection run.
+#[derive(Debug, Deserialize)]
+pub struct ProtocolConfig {
+    /// One of `b` | `g` | `n` | `lr` | `a` | `ac` | `ax`.
+    pub protocol: String,
+}
+
+impl ProtocolConfig {
+    /// Accepted protocol values, matching the firmware's `set-protocol` parser.
+    const VALID: &[&str] = &["b", "g", "n", "lr", "a", "ac", "ax"];
+
+    /// Build the `set-protocol` command, rejecting unknown values up front.
+    /// This is string-level validation only — the radio may still reject a
+    /// protocol the specific chip/band doesn't support, which surfaces at
+    /// `start`, not here.
+    pub fn to_cli_command(&self) -> Result<String, String> {
+        let protocol = self.protocol.to_ascii_lowercase();
+        if !Self::VALID.contains(&protocol.as_str()) {
+            return Err(format!(
+                "unknown protocol '{}'; expected one of: {}",
+                self.protocol,
+                Self::VALID.join(", "),
+            ));
+        }
+        Ok(format!("set-protocol --protocol={protocol}"))
+    }
+}
+
 /// `POST /api/config/io-tasks` — toggle the per-direction TX/RX Embassy tasks.
 /// Both fields are independently optional; omitted fields keep their current
 /// device-side value.
@@ -544,6 +577,11 @@ pub struct DeviceInfo {
     pub version: Option<String>,
     /// `chip=` line: `esp32` | `esp32c3` | `esp32c5` | `esp32c6` | `esp32s3` | `unknown`.
     pub chip: Option<String>,
+    /// `mac=` line — the factory eFuse base MAC (`AA:BB:CC:DD:EE:FF`). On native
+    /// USB-Serial-JTAG boards this equals the USB `iSerialNumber` descriptor, so
+    /// it is the stable per-board identity the host pins to (see
+    /// [`crate::state::DeviceHandle::mac`]). Present from CLI protocol 2 onward.
+    pub mac: Option<String>,
     /// `protocol=` line — a wire-format version number bumped on
     /// incompatible grammar changes. Host tooling should refuse unknown
     /// protocol values.
@@ -639,6 +677,36 @@ mod tests {
         assert!(CsiDeliveryConfig {
             mode: Some("bogus".to_string()),
             logging: None,
+        }
+        .to_cli_command()
+        .is_err());
+    }
+
+    #[test]
+    fn protocol_emits_lowercased_command() {
+        let cmd = ProtocolConfig {
+            protocol: "AX".to_string(),
+        }
+        .to_cli_command()
+        .unwrap();
+        assert_eq!(cmd, "set-protocol --protocol=ax");
+    }
+
+    #[test]
+    fn protocol_accepts_all_valid_values() {
+        for p in ["b", "g", "n", "lr", "a", "ac", "ax"] {
+            assert!(ProtocolConfig {
+                protocol: p.to_string(),
+            }
+            .to_cli_command()
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn protocol_rejects_unknown_value() {
+        assert!(ProtocolConfig {
+            protocol: "wifi7".to_string(),
         }
         .to_cli_command()
         .is_err());

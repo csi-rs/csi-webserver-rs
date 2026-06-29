@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{Duration, sleep};
 use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialPortType};
@@ -65,21 +65,11 @@ const ESP_USB_VIDS: &[u16] = &[
     ESPRESSIF_NATIVE_USB_VID, // Espressif built-in USB (ESP32-S3 / C3 / C6 native USB)
 ];
 
-/// True if the port at `path` is an Espressif native USB-Serial-JTAG endpoint
-/// (VID [`ESPRESSIF_NATIVE_USB_VID`]). Resolved once at device spawn so the
-/// serial task knows whether the RTS/DTR auto-reset is safe to perform.
-fn is_native_usb_port(path: &str) -> bool {
-    tokio_serial::available_ports()
-        .unwrap_or_default()
-        .into_iter()
-        .any(|p| {
-            p.port_name == path
-                && matches!(
-                    p.port_type,
-                    SerialPortType::UsbPort(info) if info.vid == ESPRESSIF_NATIVE_USB_VID
-                )
-        })
-}
+/// Per-device CSI frame broadcast buffer, in frames. Sized well above a typical
+/// burst so a momentarily-slow WebSocket client does not immediately start
+/// dropping frames; sustained overruns surface as `Lagged` and are counted in
+/// the WebSocket metrics (see [`crate::routes::ws`]).
+const CSI_BROADCAST_CAPACITY: usize = 1024;
 
 /// Detect *all* available ESP32 USB serial port paths, sorted so device-id
 /// assignment is deterministic across scans.
@@ -142,18 +132,12 @@ pub fn detect_esp_ports() -> Vec<String> {
     matched
 }
 
-/// Derive a stable, URL-safe device id from a port path, honouring any
-/// `alias=port` overrides. Falls back to the sanitized port basename
-/// (`/dev/ttyUSB0` → `ttyUSB0`); raw paths can't be ids because `/` breaks
-/// Axum path matching.
-fn id_for_port(port_path: &str, aliases: &[(String, String)]) -> String {
-    for (alias, path) in aliases {
-        if path == port_path {
-            return alias.clone();
-        }
-    }
-    let base = port_path.rsplit('/').next().unwrap_or(port_path);
-    base.chars()
+/// Sanitize an arbitrary string into a URL-safe device id: alphanumerics,
+/// `_` and `-` survive, everything else (`/`, `:`, …) becomes `-`. A MAC
+/// `D0:CF:13:E2:90:E8` → `D0-CF-13-E2-90-E8`; raw paths can't be ids because
+/// `/` breaks Axum path matching.
+fn sanitize_id(s: &str) -> String {
+    s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
@@ -164,19 +148,45 @@ fn id_for_port(port_path: &str, aliases: &[(String, String)]) -> String {
         .collect()
 }
 
+/// Derive a stable, URL-safe device id, honouring `alias=<port|mac>` overrides.
+///
+/// Identity preference, most-stable first:
+/// 1. An alias whose key matches the port path **or** the MAC.
+/// 2. The board MAC (from the USB `iSerialNumber`), sanitized — stable across a
+///    `ttyACMx` renumbering, which is the whole point of MAC-pinning.
+/// 3. The sanitized port basename (`/dev/ttyUSB0` → `ttyUSB0`) for adapters
+///    that expose no serial number; those are UART bridges that don't
+///    re-enumerate on reset, so a path-derived id is stable enough for them.
+fn device_id(port_path: &str, mac: Option<&str>, aliases: &[(String, String)]) -> String {
+    for (alias, key) in aliases {
+        if key == port_path || Some(key.as_str()) == mac {
+            return alias.clone();
+        }
+    }
+    if let Some(mac) = mac {
+        return sanitize_id(mac);
+    }
+    sanitize_id(port_path.rsplit('/').next().unwrap_or(port_path))
+}
+
 /// Build a [`DeviceHandle`] for a port, wire up its channels, and spawn the
 /// per-device serial task. Returns the shared handle for registry insertion.
-pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandle> {
+pub fn spawn_device(
+    id: String,
+    port_path: String,
+    baud: u32,
+    native_usb: bool,
+    mac: Option<String>,
+) -> Arc<DeviceHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>(64);
-    let (csi_tx, _) = broadcast::channel::<Vec<u8>>(256);
+    let (csi_tx, _) = broadcast::channel::<Vec<u8>>(CSI_BROADCAST_CAPACITY);
     let (output_mode_tx, output_mode_rx) = watch::channel(OutputMode::default());
     let (session_file_tx, session_file_rx) = watch::channel::<Option<String>>(None);
     let (info_request_tx, info_request_rx) = mpsc::channel::<InfoResponder>(4);
 
-    let native_usb = is_native_usb_port(&port_path);
-
     let dev = Arc::new(DeviceHandle {
         id,
+        mac,
         port_path,
         baud_rate: baud,
         native_usb,
@@ -204,6 +214,87 @@ pub fn spawn_device(id: String, port_path: String, baud: u32) -> Arc<DeviceHandl
     dev
 }
 
+/// One synchronous serial-port scan, intended to run inside
+/// [`tokio::task::spawn_blocking`].
+///
+/// `tokio_serial::available_ports()` is a blocking syscall that, on Linux, can
+/// stall for tens to hundreds of milliseconds while CDC-ACM ports are open —
+/// long enough to starve the runtime's I/O reactor and stutter active CSI
+/// streams if called on a worker thread. Collecting everything the supervisor
+/// needs in one off-runtime pass keeps the async loop non-blocking.
+///
+/// Returns the candidate [`PortCandidate`]s (ESP heuristics plus alias-pinned
+/// ports the OS currently lists) and the set of all present port names, used
+/// for alias reconciliation.
+fn scan_ports(aliases: &[(String, String)]) -> (Vec<PortCandidate>, HashSet<String>) {
+    let detected = detect_esp_ports();
+    let all_ports = tokio_serial::available_ports().unwrap_or_default();
+    let existing: HashSet<String> = all_ports.iter().map(|p| p.port_name.clone()).collect();
+
+    // True if `path` is an Espressif native USB-Serial-JTAG endpoint (VID
+    // 0x303A); those re-enumerate on RTS/DTR reset, so the serial task must
+    // skip the auto-reset for them.
+    let is_native = |path: &str| {
+        all_ports.iter().any(|p| {
+            p.port_name == path
+                && matches!(
+                    p.port_type,
+                    SerialPortType::UsbPort(ref info) if info.vid == ESPRESSIF_NATIVE_USB_VID
+                )
+        })
+    };
+
+    // The USB `iSerialNumber` descriptor for `path`, if any. For native
+    // USB-Serial-JTAG boards this is the eFuse MAC (`AA:BB:CC:DD:EE:FF`); read
+    // straight from the enumeration, so it's available before the port is even
+    // opened.
+    let mac_of = |path: &str| -> Option<String> {
+        all_ports.iter().find_map(|p| match &p.port_type {
+            SerialPortType::UsbPort(info) if p.port_name == path => info.serial_number.clone(),
+            _ => None,
+        })
+    };
+
+    let mut candidates: Vec<PortCandidate> = detected
+        .into_iter()
+        .map(|path| {
+            let mac = mac_of(&path);
+            PortCandidate {
+                id: device_id(&path, mac.as_deref(), aliases),
+                native_usb: is_native(&path),
+                mac,
+                path,
+            }
+        })
+        .collect();
+
+    // Honour alias-pinned ports the heuristics missed, if they exist.
+    for (alias, path) in aliases {
+        if existing.contains(path) && !candidates.iter().any(|c| &c.path == path) {
+            candidates.push(PortCandidate {
+                id: alias.clone(),
+                native_usb: is_native(path),
+                mac: mac_of(path),
+                path: path.clone(),
+            });
+        }
+    }
+
+    (candidates, existing)
+}
+
+/// One port the supervisor may register, resolved off-runtime in [`scan_ports`].
+struct PortCandidate {
+    /// Stable device id (MAC-derived, alias, or path basename).
+    id: String,
+    /// Current OS port path (`/dev/ttyACM0`).
+    path: String,
+    /// Espressif native USB-Serial-JTAG (skips the RTS auto-reset).
+    native_usb: bool,
+    /// USB `iSerialNumber` (the MAC for native USB), if exposed.
+    mac: Option<String>,
+}
+
 /// Hotplug supervisor: the single authority on which devices exist.
 ///
 /// Polls the live port set on `scan_interval`, registering newly appeared
@@ -224,38 +315,66 @@ pub async fn run_supervisor(
     let mut missing: HashMap<String, u32> = HashMap::new();
 
     loop {
-        // Candidate (id, path) pairs present on the system right now.
-        let mut candidates: Vec<(String, String)> = detect_esp_ports()
-            .into_iter()
-            .map(|path| (id_for_port(&path, &aliases), path))
-            .collect();
+        // Enumerate ports off the runtime — `available_ports()` blocks, and
+        // running it on a worker thread stalls the I/O reactor that drives the
+        // active CSI streams.
+        let aliases_scan = aliases.clone();
+        let (candidates, _existing) =
+            match tokio::task::spawn_blocking(move || scan_ports(&aliases_scan)).await {
+                Ok(scan) => scan,
+                Err(e) => {
+                    tracing::error!("Port enumeration task failed: {e}");
+                    sleep(scan_interval).await;
+                    continue;
+                }
+            };
 
-        // Honour alias-pinned ports the heuristics missed, if they exist.
-        let existing: HashSet<String> = tokio_serial::available_ports()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.port_name)
-            .collect();
-        for (alias, path) in &aliases {
-            if existing.contains(path) && !candidates.iter().any(|(_, p)| p == path) {
-                candidates.push((alias.clone(), path.clone()));
-            }
-        }
+        let present_ids: HashSet<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
 
-        let present_paths: HashSet<&str> = candidates.iter().map(|(_, p)| p.as_str()).collect();
-
-        // ── Add newly appeared devices ────────────────────────────────────
-        for (id, path) in &candidates {
-            missing.remove(id);
-            if !registry.contains(id) {
-                tracing::info!("Device added: {id} ({path})");
-                registry.insert(spawn_device(id.clone(), path.clone(), baud));
+        // ── Add newly appeared devices, and follow re-enumerated ones ─────
+        // Identity is the stable id (MAC-derived), not the port path, so a
+        // board that re-enumerates under a different `/dev/ttyACMx` is the
+        // *same* device. If its path changed we tear the old task down (it is
+        // pinned to the now-stale path) and respawn at the new one; if only
+        // the path's occupant changed we leave the healthy task alone.
+        for c in &candidates {
+            missing.remove(&c.id);
+            match registry.get(&c.id) {
+                None => {
+                    tracing::info!("Device added: {} ({})", c.id, c.path);
+                    registry.insert(spawn_device(
+                        c.id.clone(),
+                        c.path.clone(),
+                        baud,
+                        c.native_usb,
+                        c.mac.clone(),
+                    ));
+                }
+                Some(dev) if dev.port_path != c.path => {
+                    tracing::info!(
+                        "Device {} re-enumerated: {} → {} (following by MAC)",
+                        c.id,
+                        dev.port_path,
+                        c.path,
+                    );
+                    dev.shutdown.cancel();
+                    registry.insert(spawn_device(
+                        c.id.clone(),
+                        c.path.clone(),
+                        baud,
+                        c.native_usb,
+                        c.mac.clone(),
+                    ));
+                }
+                Some(_) => {}
             }
         }
 
         // ── Tear down devices absent past the debounce window ─────────────
+        // Keyed on id presence: a device whose id is no longer enumerated is
+        // gone (a path change alone is handled above as a re-enumeration).
         for dev in registry.snapshot() {
-            if present_paths.contains(dev.port_path.as_str()) {
+            if present_ids.contains(dev.id.as_str()) {
                 missing.remove(&dev.id);
                 continue;
             }
@@ -317,16 +436,20 @@ pub async fn run_serial_task(
             let _ = stream.set_exclusive(false);
         }
 
-        // Auto-reset ESP32 right after a successful serial connection.
-        // This matches the devkit EN/RTS wiring used by ESP32 USB-UART boards.
+        // Auto-reset the ESP32 right after a successful serial connection by
+        // pulsing RTS (RTS→EN). This matches the devkit EN/RTS wiring used by
+        // ESP32 USB-UART boards (CP210x / CH340) and is what gets them to
+        // (re)initialise and start answering `info` after the port opens.
         //
-        // Skipped for native USB-Serial-JTAG chips (VID 0x303A): on those the
+        // Skipped for native USB-Serial-JTAG chips (VID 0x303A). On those the
         // RTS/DTR pulse reboots the USB peripheral itself, so the device
         // re-enumerates and its `/dev/ttyACMx` node can return under a
-        // different number. The task is pinned to the original path and would
-        // then never reconnect/verify — the cause of the "second device fails
-        // to verify" failure when two such boards reset at once. These chips
-        // already answer `info` without a reset, so nothing is lost.
+        // different number — or, on slower hosts like the Raspberry Pi, the
+        // re-enumeration races with the pinned-path reconnect and leaves the
+        // USB CDC endpoint wedged (writes time out, the board never verifies,
+        // and only a physical replug recovers it). These chips already answer
+        // `info` without a reset; `quiesce_stale_stream` (a `q` to stop any
+        // auto-stream) plus the periodic re-verify loop wakes them instead.
         if dev.native_usb {
             tracing::info!(
                 "Skipping RTS auto-reset on {port_path} (native USB-Serial-JTAG; reset would re-enumerate the port)"
@@ -438,6 +561,13 @@ async fn run_serial_connection(
     let mut chip: Option<ChipInfo> = None;
 
     sleep(Duration::from_millis(700)).await;
+    // Native USB-Serial-JTAG chips skip the RTS reset above, so a device left
+    // in a stale collecting state (e.g. an auto-start firmware, or a previous
+    // run) keeps flooding binary CSI and would bury the `info` request. Stop
+    // and drain it first so the CLI is responsive before we verify.
+    if dev.native_usb {
+        quiesce_stale_stream(&mut writer, &mut reader, port_path).await;
+    }
     match do_info_exchange(&mut writer, &mut reader).await {
         Ok(info) => {
             tracing::info!(
@@ -475,6 +605,17 @@ async fn run_serial_connection(
     // Open the Parquet sink immediately if mode/session already require it.
     sync_parquet_sink(&current_mode, &current_session_path, chip.as_ref(), &mut sink);
 
+    // Per-second throughput counters. Reported on `metrics` ticks to expose
+    // where a stream stalls: `frames_in` is what we pull off the serial port,
+    // `frames_broadcast` is what reaches the per-device broadcast channel. A
+    // gap between them (or asymmetry between two devices) localises the
+    // bottleneck — see the matching WebSocket-side metrics in `routes::ws`.
+    let mut frames_in: u64 = 0;
+    let mut frames_broadcast: u64 = 0;
+    let mut metrics = tokio::time::interval(Duration::from_secs(1));
+    metrics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    metrics.tick().await; // consume the immediate first tick
+
     // Periodically re-attempt firmware verification if the initial auto-verify
     // above did not succeed. The first tick fires immediately, so consume it
     // here to avoid re-verifying on the very next loop iteration.
@@ -510,6 +651,19 @@ async fn run_serial_connection(
         const DELIMITER: u8 = b'\0';
 
         tokio::select! {
+            // ── Per-second throughput report (only while collecting) ──────
+            _ = metrics.tick() => {
+                if collection_running.load(Ordering::SeqCst) {
+                    tracing::debug!(
+                        target: "csi_metrics",
+                        "{port_path}: serial_in={frames_in}/s broadcast_out={frames_broadcast}/s ws_clients={}",
+                        csi_tx.receiver_count(),
+                    );
+                }
+                frames_in = 0;
+                frames_broadcast = 0;
+            }
+
             _ = dev.shutdown.cancelled() => {
                 return ConnectionExit::Shutdown;
             }
@@ -525,6 +679,11 @@ async fn run_serial_connection(
                 drop_next_chunk = true;
                 // Drop any partial frame; the info exchange runs in line-mode.
                 buf.clear();
+                // A native-USB device may still be flooding from a stale
+                // session; stop and drain it before re-probing.
+                if dev.native_usb {
+                    quiesce_stale_stream(&mut writer, &mut reader, port_path).await;
+                }
 
                 match do_info_exchange(&mut writer, &mut reader).await {
                     Ok(info) => {
@@ -537,9 +696,11 @@ async fn run_serial_connection(
                         firmware_verified.store(true, Ordering::SeqCst);
                         *device_info.lock().await = Some(info);
                     }
-                    Err(InfoExchangeError::Soft(_)) => {
+                    Err(InfoExchangeError::Soft(msg)) => {
                         // Still not esp-csi-cli-rs (or not responding yet);
-                        // stay unverified and try again on the next tick.
+                        // surface periodically so a stuck device is visible
+                        // rather than silently retrying forever.
+                        tracing::debug!("Re-verify on {port_path} still failing: {msg}");
                     }
                     Err(InfoExchangeError::Hard(msg)) => {
                         tracing::warn!("Serial link error during re-verify on {port_path}: {msg}");
@@ -580,6 +741,7 @@ async fn run_serial_connection(
                         let still_collecting = collection_running.load(Ordering::SeqCst);
 
                         if still_collecting && !buf.is_empty() {
+                            frames_in += 1;
                             if matches!(current_mode, OutputMode::Dump | OutputMode::Both) {
                                 if let (Some(sink), Some(chip)) = (sink.as_mut(), chip.as_ref()) {
                                     match csi::decode(&buf, chip.variant) {
@@ -589,11 +751,21 @@ async fn run_serial_connection(
                                                 tracing::error!("Parquet write error: {e}");
                                             }
                                         }
-                                        Err(_) => {
+                                        Err(e) => {
                                             decode_errors += 1;
-                                            // Log sparsely to avoid flooding on a
-                                            // persistent wire mismatch.
-                                            if decode_errors.is_power_of_two() {
+                                            // Hex-dump the first few raw frames to
+                                            // diagnose wire mismatches (run with
+                                            // RUST_LOG=debug).
+                                            if decode_errors <= 3 {
+                                                let hex: String = buf
+                                                    .iter()
+                                                    .map(|b| format!("{b:02x}"))
+                                                    .collect();
+                                                tracing::warn!(
+                                                    "Decode error #{decode_errors} on {port_path}: {e}; cobs_len={} frame_hex={hex}",
+                                                    buf.len(),
+                                                );
+                                            } else if decode_errors.is_power_of_two() {
                                                 tracing::warn!(
                                                     "Failed to decode CSI frame on {port_path} ({} total); check firmware/chip wire compatibility",
                                                     decode_errors,
@@ -603,8 +775,10 @@ async fn run_serial_connection(
                                     }
                                 }
                             }
-                            if matches!(current_mode, OutputMode::Stream | OutputMode::Both) {
-                                let _ = csi_tx.send(buf.clone());
+                            if matches!(current_mode, OutputMode::Stream | OutputMode::Both)
+                                && csi_tx.send(buf.clone()).is_ok()
+                            {
+                                frames_broadcast += 1;
                             }
                         }
                         buf.clear();
@@ -629,16 +803,16 @@ async fn run_serial_connection(
                             tracing::error!("Serial write error: {e}");
                             return ConnectionExit::Disconnected;
                         }
-                        // Flush so the bytes leave the host buffer
-                        // immediately. This matters most for the `q`
-                        // stop signal — without an explicit flush, the
-                        // OS may sit on the byte while CSI traffic keeps
-                        // streaming back, delaying the firmware's
-                        // STOP_REQUEST and prolonging the collection.
-                        if let Err(e) = writer.flush().await {
-                            tracing::error!("Serial flush error: {e}");
-                            return ConnectionExit::Disconnected;
-                        }
+                        // NB: deliberately no `flush()` here. tokio-serial maps
+                        // `flush` to a blocking `tcdrain()` that runs on the
+                        // tokio worker thread and waits for the UART/USB FIFO to
+                        // physically empty. If the device browns out or its USB
+                        // endpoint wedges (common with several native-USB boards
+                        // on one bus), `tcdrain` blocks forever and takes the
+                        // worker with it — enough of them freezes the whole
+                        // runtime. `write_all` has already handed the bytes to
+                        // the kernel via a non-blocking write; the USB stack
+                        // sends them without us draining.
                     }
                     None => {
                         return ConnectionExit::CommandChannelClosed;
@@ -687,6 +861,43 @@ async fn run_serial_connection(
     }
 }
 
+/// Bring a possibly-streaming device back to a responsive CLI.
+///
+/// Sends a stop (`q`) and discards whatever the device emits until the stream
+/// goes idle (or a short cap elapses). Used on native USB-Serial-JTAG chips,
+/// which skip the RTS reset and so may still be flooding CSI from a previous
+/// session — without this, that flood buries the `info` request and the device
+/// never verifies.
+async fn quiesce_stale_stream<W, R>(writer: &mut W, reader: &mut BufReader<R>, port_path: &str)
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    // No `flush()`: it maps to a blocking `tcdrain()` on the worker thread that
+    // hangs forever if the device's USB endpoint has wedged. `write_all` already
+    // delivered the bytes to the kernel.
+    let _ = writer.write_all(b"q\r\n").await;
+
+    let mut scratch = [0u8; 2048];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut drained = 0usize;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, reader.read(&mut scratch)).await {
+            Ok(Ok(0)) => break,           // EOF
+            Ok(Ok(n)) => drained += n,    // discard backlog and keep draining
+            Ok(Err(_)) => break,
+            Err(_) => break,              // idle — stream has quiesced
+        }
+    }
+    if drained > 0 {
+        tracing::info!("Drained {drained} bytes of stale stream on {port_path} before verify");
+    }
+}
+
 /// Issue a single `info` command on the link and read until the `END-INFO`
 /// sentinel arrives or [`INFO_RESPONSE_TIMEOUT`] elapses. Returns
 /// `Soft` errors when the link is healthy but the firmware is not (or not
@@ -702,9 +913,9 @@ where
     if let Err(e) = writer.write_all(b"info\r\n").await {
         return Err(InfoExchangeError::Hard(format!("Serial write error: {e}")));
     }
-    if let Err(e) = writer.flush().await {
-        return Err(InfoExchangeError::Hard(format!("Serial flush error: {e}")));
-    }
+    // No `flush()`: tokio-serial's flush is a blocking `tcdrain()` that wedges
+    // the worker thread if the device's USB endpoint stalls. The non-blocking
+    // `write_all` above is sufficient to send the command.
 
     let deadline = tokio::time::Instant::now() + INFO_RESPONSE_TIMEOUT;
     let mut info_buf: Vec<u8> = Vec::new();
@@ -772,6 +983,7 @@ fn parse_info_block(buf: &[u8]) -> Result<DeviceInfo, String> {
         name: None,
         version: None,
         chip: None,
+        mac: None,
         protocol: None,
         features: Vec::new(),
     };
@@ -784,6 +996,7 @@ fn parse_info_block(buf: &[u8]) -> Result<DeviceInfo, String> {
             "name" => info.name = Some(v.to_string()),
             "version" => info.version = Some(v.to_string()),
             "chip" => info.chip = Some(v.to_string()),
+            "mac" => info.mac = Some(v.to_string()),
             "protocol" => info.protocol = v.parse().ok(),
             "features" => {
                 info.features = v

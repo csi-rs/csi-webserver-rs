@@ -48,8 +48,9 @@ Example response body:
 ```json
 [
   {
-    "id": "ttyUSB0",
-    "port_path": "/dev/ttyUSB0",
+    "id": "D0-CF-13-E2-90-E8",
+    "mac": "D0:CF:13:E2:90:E8",
+    "port_path": "/dev/ttyACM0",
     "baud_rate": 115200,
     "serial_connected": true,
     "collection_running": false,
@@ -59,7 +60,8 @@ Example response body:
       "name": "esp-csi-cli-rs",
       "version": "0.5.0",
       "chip": "esp32c6",
-      "protocol": 1,
+      "mac": "D0:CF:13:E2:90:E8",
+      "protocol": 2,
       "features": ["statistics"]
     }
   }
@@ -68,6 +70,16 @@ Example response body:
 
 `device_info` is `null` until the firmware identity has been verified for that
 device (see [Firmware gate](#firmware-gate)).
+
+**Device identity.** `id` is the value used in `/api/devices/{id}/...` URLs. It
+is derived from the board's `mac` (its USB `iSerialNumber`, the eFuse base MAC)
+when available, so it stays stable even if the OS renumbers the port — e.g. a
+native USB-Serial-JTAG board that re-enumerates from `/dev/ttyACM0` to
+`/dev/ttyACM2` keeps the same `id`, and the server transparently follows it to
+the new `port_path`. Boards exposing no serial number (most CP210x/CH340 UART
+bridges) fall back to an `id` derived from the port basename. A
+`--device <alias>=<port|mac>` launch flag overrides the `id` with a friendly
+name (matched against either the port path or the MAC).
 
 ## Firmware gate
 
@@ -81,9 +93,13 @@ this:
   the firmware is marked verified and the parsed [`DeviceInfo`](#get-apidevicesidinfo)
   is cached.
 - A successful `GET /api/devices/{id}/info` call refreshes the cached identity.
-- `POST /api/devices/{id}/control/reset` *invalidates* the cached identity, pulses RTS,
-  waits for the chip to boot, and re-runs the `info` exchange. The HTTP
-  response includes whether re-verification succeeded.
+- `POST /api/devices/{id}/control/reset` *invalidates* the cached identity and
+  resets the chip. For UART adapters (CP210x/CH340) it pulses RTS, waits for the
+  chip to boot, and synchronously re-runs the `info` exchange — the HTTP
+  response reports whether re-verification succeeded. For native USB-Serial-JTAG
+  boards it sends the firmware `restart` command instead (pulsing RTS there
+  re-enumerates/wedges the USB port) and returns immediately; the board
+  re-verifies automatically on reconnect, so poll `GET /api/devices` to confirm.
 - A USB disconnect clears the verified state — a different chip may be
   attached on reconnect.
 
@@ -141,7 +157,8 @@ Successful response (200 OK):
   "name": "esp-csi-cli-rs",
   "version": "0.5.0",
   "chip": "esp32c6",
-  "protocol": 1,
+  "mac": "D0:CF:13:E2:90:E8",
+  "protocol": 2,
   "features": ["statistics", "println", "auto"]
 }
 ```
@@ -159,9 +176,13 @@ Notes:
 
 - `banner_version` is parsed from the `ESP-CSI-CLI/<version>` magic prefix
   emitted on every reset and at the top of the `info` block.
+- `mac` is the factory eFuse base MAC (`AA:BB:CC:DD:EE:FF`), present from
+  CLI protocol 2 onward (`null` on older firmware). It matches the USB
+  `iSerialNumber` and is the stable identity the server pins each device to
+  (see [`GET /api/devices`](#get-apidevices)).
 - `protocol` is a wire-format version number from the firmware
   (`CLI_PROTOCOL_VERSION`); a host should refuse to operate against unknown
-  protocol values.
+  protocol values. `2` adds the `mac=` line.
 - `features` is informational — for example, the presence of `statistics`
   means `POST /api/devices/{id}/control/stats` is available on the device side. Treat it
   as an unordered set.
@@ -432,6 +453,34 @@ Notes:
 - Sniffer and station modes ignore the setting.
 - Unknown rate values are caught by the firmware (no mutation), not by the
   server.
+
+### `POST /api/devices/{id}/config/protocol`
+
+Set the Wi-Fi PHY protocol applied to the node at the start of each collection
+run. Forwards `set-protocol`.
+
+Request body:
+
+```json
+{ "protocol": "lr" }
+```
+
+- `protocol` — one of: `b` (802.11b), `g` (802.11g), `n` (802.11n),
+  `lr` (Espressif Long-Range), `a` (802.11a), `ac` (802.11ac), `ax` (802.11ax).
+  Case-insensitive. Default on the device is `lr`.
+
+Notes:
+
+- Applied at the **start** of each run (read from config), not on command
+  entry — set it before `POST .../control/start`.
+- Independent of the PHY rate (`/api/devices/{id}/config/rate`); both are
+  separate knobs.
+- The protocol is **not** auto-derived from the Wi-Fi mode. To associate with a
+  standard AP in station mode you must set `n` (or `ax`) explicitly — the
+  default `lr` is Espressif-proprietary and won't associate.
+- Unknown values return `400 Bad Request` (validated by the server). A protocol
+  the chip/band can't support is rejected by the radio at `start`, not here.
+- Appears in the cached config under `collection.protocol`.
 
 ### `POST /api/devices/{id}/config/io-tasks`
 

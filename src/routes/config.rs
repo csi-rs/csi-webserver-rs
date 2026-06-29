@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::{
     models::{
         ApiResponse, CollectionModeConfig, CsiConfig, CsiDeliveryConfig, DeviceConfig,
-        IoTasksConfig, OutputMode, OutputModeConfig, RateConfig, TrafficConfig,
+        IoTasksConfig, OutputMode, OutputModeConfig, ProtocolConfig, RateConfig, TrafficConfig,
         WifiConfig,
     },
     routes::Device,
@@ -210,6 +210,27 @@ pub async fn set_rate(
     let result = send_cmd(&dev, cmd).await;
     if result.0 == StatusCode::OK {
         dev.config.lock().await.collection.phy_rate = Some(body.rate);
+    }
+    result
+}
+
+// ─── POST /api/config/protocol ──────────────────────────────────────────────
+
+/// Set the Wi-Fi PHY protocol applied at the start of each collection run.
+/// Forwards `set-protocol`. The setting is read at `start`, so change it
+/// before starting a run.
+pub async fn set_protocol(
+    Device(dev): Device,
+    Json(body): Json<ProtocolConfig>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let cmd = match body.to_cli_command() {
+        Ok(c) => c,
+        Err(message) => return bad_request(message),
+    };
+    let result = send_cmd(&dev, cmd).await;
+    if result.0 == StatusCode::OK {
+        // Cache the normalized (lowercased) value so it matches `show-config`.
+        dev.config.lock().await.collection.protocol = Some(body.protocol.to_ascii_lowercase());
     }
     result
 }

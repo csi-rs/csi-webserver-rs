@@ -82,10 +82,11 @@ struct Cli {
     #[arg(long, env = "CSI_BAUD_RATE", default_value_t = 115_200)]
     baud_rate: u32,
 
-    /// Pin a stable device id to a specific port, e.g. `--device lab1=/dev/ttyUSB0`.
-    /// Repeatable. Without an override, a device's id is the sanitized port
-    /// basename (e.g. `ttyUSB0`).
-    #[arg(long = "device", value_name = "ALIAS=PORT")]
+    /// Pin a friendly device id to a specific port or MAC, e.g.
+    /// `--device lab1=/dev/ttyUSB0` or `--device lab1=D0:CF:13:E2:90:E8`.
+    /// Repeatable. Without an override, a device's id is its MAC (the USB
+    /// `iSerialNumber`) when available, else the sanitized port basename.
+    #[arg(long = "device", value_name = "ALIAS=PORT_OR_MAC")]
     devices: Vec<String>,
 
     /// How often (in milliseconds) the hotplug supervisor rescans for attached
@@ -157,6 +158,7 @@ async fn main() {
         )
         .route("/config/output-mode", post(routes::config::set_output_mode))
         .route("/config/rate", post(routes::config::set_rate))
+        .route("/config/protocol", post(routes::config::set_protocol))
         .route("/config/io-tasks", post(routes::config::set_io_tasks))
         .route("/config/csi-delivery", post(routes::config::set_csi_delivery))
         // Control

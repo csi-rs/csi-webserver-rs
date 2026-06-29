@@ -11,6 +11,9 @@ use crate::{models::DeviceInfo, state::AppState};
 #[derive(Serialize)]
 pub struct DeviceSummary {
     pub id: String,
+    /// Stable board MAC from the USB `iSerialNumber` descriptor; the id is
+    /// derived from this. `None` for adapters that expose no serial number.
+    pub mac: Option<String>,
     pub port_path: String,
     pub baud_rate: u32,
     pub serial_connected: bool,
@@ -29,6 +32,7 @@ pub async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceSumma
     for dev in state.devices.snapshot() {
         out.push(DeviceSummary {
             id: dev.id.clone(),
+            mac: dev.mac.clone(),
             port_path: dev.port_path.clone(),
             baud_rate: dev.baud_rate,
             serial_connected: dev.serial_connected.load(Ordering::SeqCst),

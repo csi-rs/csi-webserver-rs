@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use tokio::sync::broadcast;
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -57,7 +58,8 @@ pub async fn ws_handler(Device(dev): Device, req: axum::extract::Request) -> Res
     // Clone (not the whole handle) so an unplug — which cancels this token via
     // the supervisor — promptly closes the socket regardless of Arc lifetimes.
     let shutdown = dev.shutdown.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, rx, shutdown))
+    let id = dev.id.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, rx, shutdown, id))
         .into_response()
 }
 
@@ -65,9 +67,33 @@ async fn handle_socket(
     mut socket: WebSocket,
     mut rx: broadcast::Receiver<Vec<u8>>,
     shutdown: CancellationToken,
+    id: String,
 ) {
+    // Per-second WebSocket-side throughput counters, the consumer-side
+    // companion to the serial-side metrics in `crate::serial`. `sent` is what
+    // the client actually received; `dropped` is what the broadcast channel
+    // discarded because this client could not keep up (`Lagged`). A device that
+    // streams slowly with high `dropped` is consumer-bound, not serial-bound.
+    let mut sent: u64 = 0;
+    let mut dropped: u64 = 0;
+    let mut metrics = tokio::time::interval(Duration::from_secs(1));
+    metrics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    metrics.tick().await; // consume the immediate first tick
+
     loop {
         tokio::select! {
+            // ── Per-second throughput report ──────────────────────────────
+            _ = metrics.tick() => {
+                if sent > 0 || dropped > 0 {
+                    tracing::debug!(
+                        target: "csi_metrics",
+                        "ws {id}: sent={sent}/s dropped={dropped}/s",
+                    );
+                    sent = 0;
+                    dropped = 0;
+                }
+            }
+
             // ── Device unplugged: close the socket cleanly ────────────────
             _ = shutdown.cancelled() => {
                 let _ = socket.send(Message::Close(None)).await;
@@ -82,6 +108,7 @@ async fn handle_socket(
                             // Client disconnected or send failed.
                             break;
                         }
+                        sent += 1;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Broadcast channel shut down (server stopping).
@@ -89,7 +116,8 @@ async fn handle_socket(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // The client is too slow; skip dropped packets but stay connected.
-                        tracing::warn!("WebSocket client lagged — dropped {n} CSI packets");
+                        dropped += n;
+                        tracing::warn!("WebSocket client for {id} lagged — dropped {n} CSI packets");
                     }
                 }
             }
@@ -104,5 +132,5 @@ async fn handle_socket(
         }
     }
 
-    tracing::debug!("WebSocket client disconnected");
+    tracing::debug!("WebSocket client for {id} disconnected");
 }

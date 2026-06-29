@@ -544,6 +544,30 @@ mod tests {
         assert!(out.date_time.is_none());
     }
 
+    /// A clean esp32c5 frame round-trips through `to_slice_cobs` (as the
+    /// firmware emits it) and back through `decode`.
+    #[test]
+    fn decode_packet_bc5_roundtrip() {
+        let pkt = PacketBc5 {
+            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x05],
+            rssi: -61, timestamp: 123456, rate: 1, noise_floor: -92, sig_len: 80,
+            rx_state: 0, dump_len: 384, cur_bb_format: 2, rx_channel_estimate_info_vld: 1,
+            rx_channel_estimate_len: 384, second: 7, channel: 149, is_group: 0,
+            rxend_state: 0, rxmatch3: 0, rxmatch2: 0, rxmatch1: 1, date_time: None,
+            sequence_number: 99, csi_data_len: 4, data_format: RxCsiFmt::Undefined,
+            csi_data: vec![1, -2, 3, -4],
+        };
+        let mut buf = vec![0u8; 2048];
+        let cobs = postcard::to_slice_cobs(&pkt, &mut buf).unwrap();
+        let body = cobs.strip_suffix(&[0]).unwrap_or(cobs);
+        let out = decode(body, ChipVariant::Esp32c5).unwrap();
+        assert_eq!(out.channel, 149);
+        assert_eq!(out.mac, [0xde, 0xad, 0xbe, 0xef, 0x00, 0x05]);
+        assert_eq!(out.csi_data, vec![1, -2, 3, -4]);
+        assert_eq!(out.dump_len, Some(384));
+        assert_eq!(out.sgi, None);
+    }
+
     #[test]
     fn chip_string_mapping() {
         assert_eq!(ChipVariant::from_chip_str("ESP32"), Some(ChipVariant::Esp32Family));

@@ -25,11 +25,22 @@ pub type InfoResponder = oneshot::Sender<Result<DeviceInfo, String>>;
 /// mutexes, and watch senders are plain (not individually `Arc`-wrapped): the
 /// single `Arc<DeviceHandle>` provides the sharing.
 pub struct DeviceHandle {
-    /// Stable identifier used in URL paths (e.g. `ttyUSB0`, or a CLI alias).
+    /// Stable identifier used in URL paths. Derived from the board's MAC
+    /// (`D0-CF-13-E2-90-E8`) when known, so it survives a `ttyACMx`
+    /// renumbering; falls back to a CLI alias or the sanitized port basename.
     pub id: String,
+    /// Stable hardware identity: the board's MAC as reported by its USB
+    /// `iSerialNumber` descriptor (`AA:BB:CC:DD:EE:FF`), read at scan time
+    /// without opening the port. `None` for adapters that expose no serial
+    /// number (most CP210x/CH340 UART bridges). This is what lets the
+    /// supervisor follow a board across a re-enumeration that changes its
+    /// `/dev/ttyACMx` number — see [`crate::serial::run_supervisor`]. The
+    /// firmware also echoes it in the `info` block (`mac=`) as confirmation.
+    pub mac: Option<String>,
     /// USB serial port path used to reach the ESP32 (e.g. `/dev/ttyUSB0`).
-    /// Pinned at construction — the serial task reconnects to this same path
-    /// and never re-detects, so two tasks can't race for one port.
+    /// Pinned for the lifetime of the per-device task; if the board
+    /// re-enumerates under a different node the supervisor tears this task
+    /// down and respawns it (keyed by [`Self::mac`]) at the new path.
     pub port_path: String,
     /// Baud rate negotiated at startup. The serial task and the RTS-reset
     /// handler both read this so a single source of truth governs the link.
@@ -124,11 +135,6 @@ impl DeviceRegistry {
     /// Remove a device by id, returning its handle if present.
     pub fn remove(&self, id: &str) -> Option<Arc<DeviceHandle>> {
         self.map.write().unwrap().remove(id)
-    }
-
-    /// True if a device with this id is currently registered.
-    pub fn contains(&self, id: &str) -> bool {
-        self.map.read().unwrap().contains_key(id)
     }
 
     /// Snapshot of all current devices, sorted by id for stable listings.
