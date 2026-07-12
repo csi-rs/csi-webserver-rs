@@ -757,7 +757,7 @@ are nullable and left null otherwise. Check the `chip` column (or
 | `dt_year`…`dt_millisecond` | uint64 (nullable) | all | NTP calendar time, null unless the device set it. |
 | `sgi`, `secondary_channel`, `bandwidth`, `antenna`, `sig_mode`, `mcs`, `smoothing`, `not_sounding`, `aggregation`, `stbc`, `fec_coding`, `ampdu_cnt` | uint32 (nullable) | esp32 / c3 / s3 | Radio metadata; null on c5/c6. |
 | `dump_len`, `cur_bb_format`, `rx_channel_estimate_info_vld`, `rx_channel_estimate_len`, `second`, `is_group`, `rxend_state`, `rxmatch3`, `rxmatch2`, `rxmatch1` | uint32 (nullable) | c5 / c6 | Null on esp32-family. |
-| `he_sigb_len`, `cur_single_mpdu`, `rxmatch0` | uint32 (nullable) | c6 only | Null elsewhere. |
+| `sigb_len`, `cur_single_mpdu`, `rxmatch0` | uint32 (nullable) | c6 only | Null elsewhere. |
 
 `host_rx_time` is the host's wall clock; `timestamp` is the device's
 microseconds-since-boot counter — use `host_rx_time` to correlate across
@@ -789,7 +789,7 @@ COBS-framed (the server strips the trailing `\0`). To decode: COBS-decode, then
     data_format:RxCSIFmt, csi_data_len:u16, csi_data:Vec<i8>`.
   - **esp32c5 / esp32c6**: `mac[6], rssi:i32, timestamp:u32, rate:u32,
     noise_floor:i32, sig_len:u32, rx_state:u32, dump_len:u32,
-    [he_sigb_len:u32, cur_single_mpdu:u32 — c6 only], cur_bb_format:u32,
+    [sigb_len:u32, cur_single_mpdu:u32 — c6 only], cur_bb_format:u32,
     rx_channel_estimate_info_vld:u32, rx_channel_estimate_len:u32, second:u32,
     channel:u32, is_group:u32, rxend_state:u32, rxmatch3:u32, rxmatch2:u32,
     rxmatch1:u32, [rxmatch0:u32 — c6 only], date_time:Option<DateTime>,
