@@ -1,6 +1,6 @@
 [package]
 name = "csi-webserver"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "CSI webserver executable — hotplug supervisor, HTTP API, and WebSocket streaming for ESP32 CSI capture"
 license = "Apache-2.0"
