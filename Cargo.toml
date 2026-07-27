@@ -18,7 +18,7 @@ name = "csi-webserver"
 path = "src/main.rs"
 
 [dependencies]
-csi-webserver-core = { path = "../csi-pipeline/csi-webserver-core", version = "0.1.0" }
+csi-webserver-core = { git = "https://github.com/csi-rs/csi-webserver-core-rs.git", branch = "feat/emitter-collector" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
