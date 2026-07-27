@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "csi-webserver"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "csi-webserver-core",
@@ -644,7 +644,8 @@ dependencies = [
 
 [[package]]
 name = "csi-webserver-core"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+https://github.com/csi-rs/csi-webserver-core-rs.git?branch=feat%2Femitter-collector#e2c1ed544cefd396832eb8c8c8e10c37266282ae"
 dependencies = [
  "arrow",
  "axum",
