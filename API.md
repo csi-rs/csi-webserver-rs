@@ -414,11 +414,9 @@ Notes:
   - `ht40` — `wifi-ap` mode (silently ignored elsewhere)
   - PHY rate (`/api/devices/{id}/config/rate`) — all modes except `station`.
     An emitter forces its own TX PHY for the injected sounding frames.
-- **Wi-Fi 6 (HE20) is not part of this surface.** The `he20-emitter` and
-  `he20-collector` modes, and the 802.11ax HE-LTF capture they imply, exist
-  only in the proprietary *pro* firmware build. Sending either value to an
-  open-build device returns whatever the firmware reports for an unknown mode;
-  this server does not accept or document them.
+- **Modes this server does not list are not part of this surface.** An embedder can add modes
+  through the `CsiProfile` seam in `csi-webserver-core`; sending an unlisted value to a device that
+  does not implement it returns whatever the firmware reports for an unknown mode.
 
 ### `POST /api/devices/{id}/config/traffic`
 
@@ -477,11 +475,9 @@ Field groups:
 - HE (ESP32-C5 / ESP32-C6): `csi`, `csi_legacy`, `csi_ht20`, `csi_ht40`,
   `dump_ack`, `val_scale_cfg` (`u32`).
 - ESP32-C5 only: `csi_force_lltf`, `csi_vht`.
-- Preset (C5/C6): `preset` — **`default` is the only accepted value**; it
-  restores `CsiConfig::default()`. There is no `he20` preset and no other
-  named preset on this surface. HE20 acquisition profiles belong to the
-  proprietary *pro* firmware build, which this server does not target; any
-  claim that `csi-webserver` ships an HE20 preset is incorrect.
+- Preset (C5/C6): `preset` — **`default` is the only accepted value**; it restores
+  `CsiConfig::default()`. Other named presets, where they exist, come from an embedder's
+  `CsiProfile` and are not part of this surface.
 
 `val_scale_cfg` ranges are documented in firmware help but
 **not enforced** — out-of-range values are passed through.

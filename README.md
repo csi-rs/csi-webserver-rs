@@ -67,13 +67,37 @@ csi-webserver [OPTIONS]
 
 ## Output modes
 
-| Mode | WebSocket | Parquet dump |
+| Output mode | WebSocket | Parquet dump |
 |------|-----------|--------------|
 | `stream` (default) | yes | no |
 | `dump` | no | yes |
 | `both` | yes | yes |
 
-Set via `POST /api/devices/{id}/config/output-mode` — see [API.md](API.md).
+Set via `POST /api/devices/{id}/config/output-mode` — see [API.md](API.md). This is where the CSI
+goes, not how the node reaches the channel; that is the node's **operational mode**, set with
+`POST /api/devices/{id}/config/wifi`.
+
+## The node model
+
+A node is described by four independent attributes — what it contributes to the network, whether
+its measurements leave it, how it reaches the channel, and what part it plays in the session. This
+server sets the third and validates against the rest.
+
+The model is documented once, in
+[`esp-csi-rs/docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
+The accepted `wifi` mode tokens are listed in
+[`csi-webserver-core`'s README](https://github.com/csi-rs/csi-webserver-core-rs#node-modes).
+
+## Flashing a board
+
+```sh
+csi-webserver flash --port /dev/ttyACM0 --chip c6
+```
+
+Writes a merged image with `espflash write-bin`, defaulting to
+`<firmware-dir>/esp-csi-cli-rs-<chip>.bin` (`--firmware-dir`, or `CSI_FIRMWARE_DIR`). **Stop the
+server first** — a serial port has a single holder, and the supervisor owns every port it has
+discovered. Needs `espflash` on `PATH`.
 
 ## Environment variables
 
