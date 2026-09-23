@@ -38,10 +38,6 @@ cargo run -- --interface 127.0.0.1 --port 3000 --baud-rate 921600
 cargo run -- --device lab1=/dev/ttyUSB0 --scan-interval-ms 1000
 ```
 
-The manifest patches `csi-webserver-core` to a sibling checkout at `../csi-webserver-core`
-(`[patch.crates-io]`); clone [csi-webserver-core-rs](https://github.com/csi-rs/csi-webserver-core-rs)
-next to this repository, or delete the patch to build against crates.io.
-
 ## Quick start
 
 ```bash

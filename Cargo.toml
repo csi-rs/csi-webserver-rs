@@ -23,8 +23,3 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
-
-# Build against the sibling checkout until csi-webserver-core 0.2 is on crates.io. Dropped at
-# publish time.
-[patch.crates-io]
-csi-webserver-core = { path = "../csi-webserver-core" }
