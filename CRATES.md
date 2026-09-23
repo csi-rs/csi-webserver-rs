@@ -11,6 +11,12 @@ forwards them to:
 
 Built on the [`csi-webserver-core`](https://docs.rs/csi-webserver-core) library.
 
+Each board is configured through `POST /api/devices/{id}/config/wifi`, whose `mode` selects the
+node's operational mode — Wi-Fi station, sniffer or access point, an HT20/HT40 emitter, or an
+ESP-NOW or ESP-NOW simplex end — and whose optional `collection` (`collector` | `listener`) sets
+its collection mode where the mode admits a choice. The node model behind those terms is defined in
+[`docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
+
 ## Install
 
 ```bash
@@ -26,7 +32,10 @@ csi-webserver --interface 0.0.0.0 --port 3000
 ### CLI options
 
 ```text
-csi-webserver [OPTIONS]
+csi-webserver [OPTIONS] [COMMAND]
+
+Commands:
+  flash  Flash a merged firmware image to a board over serial
 
 Options:
       --interface <INTERFACE>       Network interface to bind to [default: 0.0.0.0]
@@ -37,6 +46,18 @@ Options:
   -h, --help                          Print help
   -V, --version                       Print version
 ```
+
+### Flashing a board
+
+```bash
+csi-webserver flash --port /dev/ttyACM0 --chip c6
+```
+
+Writes a merged image with `espflash write-bin` (needs `espflash` on `PATH`). `--chip` is one of
+`esp32`, `c3`, `c5`, `c6`, `s3`; the image defaults to `<firmware-dir>/esp-csi-cli-rs-<chip>.bin`
+(`--firmware-dir`, or `CSI_FIRMWARE_DIR`, default `dist`), or pass `--image <PATH>`; `--address`
+sets the offset (default `0x0`). Stop the server first — the supervisor holds every serial port it
+has discovered.
 
 ## Firmware requirement
 
@@ -73,15 +94,17 @@ Switch at runtime with `POST /api/devices/{id}/config/output-mode`.
 |----------|---------|-------------|
 | `CSI_SERIAL_PORT` | auto-detect | Override serial port path |
 | `CSI_BAUD_RATE` | `115200` | Override serial baud rate (also `--baud-rate`) |
-| `RUST_LOG` | `csi_webserver_core=debug` | Tracing filter |
+| `RUST_LOG` | `csi_webserver_core=debug,csi_webserver=debug` | Tracing filter |
+| `CSI_FIRMWARE_DIR` | `dist` | Image directory for `flash` |
 
 ## Documentation
 
 | Resource | Link |
 |----------|------|
-| HTTP API reference | [API.md](https://github.com/csi-rs/csi-webserver-rs/blob/main/crates/csi-webserver/API.md) |
-| Service README | [README.md](https://github.com/csi-rs/csi-webserver-rs/blob/main/crates/csi-webserver/README.md) |
-| Library (embedding) | [csi-webserver-core on docs.rs](https://docs.rs/csi-webserver-core)
+| HTTP API reference | [API.md](https://github.com/csi-rs/csi-webserver-rs/blob/main/API.md) |
+| Service README | [README.md](https://github.com/csi-rs/csi-webserver-rs/blob/main/README.md) |
+| Node model | [network-model.md](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md) |
+| Library (embedding) | [csi-webserver-core on docs.rs](https://docs.rs/csi-webserver-core) |
 
 ## License
 
