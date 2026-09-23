@@ -12,8 +12,7 @@ Built on the [`csi-webserver-core`](https://docs.rs/csi-webserver-core) library.
 |----------|----------|
 | [CRATES.md](CRATES.md) | crates.io package summary |
 | [API.md](API.md) | Full HTTP/WebSocket API reference |
-| [MIGRATION.md](MIGRATION.md) | Upgrade notes from older layouts |
-| [Library README](../csi-webserver-core/README.md) | Embedding the server in your own app |
+| [Library README](https://github.com/csi-rs/csi-webserver-core-rs#readme) | Embedding the server in your own app |
 
 ## Prerequisites
 
@@ -31,13 +30,17 @@ csi-webserver --help
 
 ## Run from source
 
-From the workspace root:
+From the repository root:
 
 ```bash
-cargo run -p csi-webserver
-cargo run -p csi-webserver -- --interface 127.0.0.1 --port 3000 --baud-rate 921600
-cargo run -p csi-webserver -- --device lab1=/dev/ttyUSB0 --scan-interval-ms 1000
+cargo run
+cargo run -- --interface 127.0.0.1 --port 3000 --baud-rate 921600
+cargo run -- --device lab1=/dev/ttyUSB0 --scan-interval-ms 1000
 ```
+
+The manifest patches `csi-webserver-core` to a sibling checkout at `../csi-webserver-core`
+(`[patch.crates-io]`); clone [csi-webserver-core-rs](https://github.com/csi-rs/csi-webserver-core-rs)
+next to this repository, or delete the patch to build against crates.io.
 
 ## Quick start
 
@@ -56,8 +59,12 @@ See [API.md](API.md) for every endpoint, payload, and status code.
 ## CLI options
 
 ```text
-csi-webserver [OPTIONS]
+csi-webserver [OPTIONS] [COMMAND]
 
+Commands:
+  flash  Flash a merged firmware image to a board over serial
+
+Options:
       --interface <INTERFACE>       Bind address [default: 0.0.0.0]
       --port <PORT>                 TCP port [default: 3000]
       --baud-rate <BAUD_RATE>       UART baud [env: CSI_BAUD_RATE] [default: 115200]
@@ -67,13 +74,41 @@ csi-webserver [OPTIONS]
 
 ## Output modes
 
-| Mode | WebSocket | Parquet dump |
+| Output mode | WebSocket | Parquet dump |
 |------|-----------|--------------|
 | `stream` (default) | yes | no |
 | `dump` | no | yes |
 | `both` | yes | yes |
 
-Set via `POST /api/devices/{id}/config/output-mode` — see [API.md](API.md).
+Set via `POST /api/devices/{id}/config/output-mode` — see [API.md](API.md). This is where the CSI
+goes, not how the node reaches the channel; that is the node's **operational mode**, set with
+`POST /api/devices/{id}/config/wifi`.
+
+## The node model
+
+A node is described by four attributes — what it contributes to the network (network role),
+whether its measurements leave it (collection mode), how it reaches the channel (operational mode),
+and what part it plays in the session (session role). Through `POST /api/devices/{id}/config/wifi`
+this server sets the operational mode (`mode`) and, where the mode admits a choice, the collection
+mode (`collection`: `collector` | `listener`); the network role follows from the mode, and the
+server is always the session initiator.
+
+The model is documented once, in
+[`esp-csi-rs/docs/network-model.md`](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
+The accepted `wifi` mode tokens are listed in
+[`csi-webserver-core`'s README](https://github.com/csi-rs/csi-webserver-core-rs#node-modes).
+
+## Flashing a board
+
+```sh
+csi-webserver flash --port /dev/ttyACM0 --chip c6
+```
+
+Writes a merged image with `espflash write-bin`, defaulting to
+`<firmware-dir>/esp-csi-cli-rs-<chip>.bin` (`--firmware-dir`, or `CSI_FIRMWARE_DIR`). **Stop the
+server first** — a serial port has a single holder, and the supervisor owns every port it has
+discovered. Needs `espflash` on `PATH`. `--image <PATH>` flashes an explicit image instead, and
+`--address` sets the write offset (default `0x0`).
 
 ## Environment variables
 
@@ -81,7 +116,7 @@ Set via `POST /api/devices/{id}/config/output-mode` — see [API.md](API.md).
 |----------|---------|-------------|
 | `CSI_SERIAL_PORT` | auto-detect | Pin one serial port |
 | `CSI_BAUD_RATE` | `115200` | Serial baud rate |
-| `RUST_LOG` | `csi_webserver_core=debug` | Tracing filter |
+| `RUST_LOG` | `csi_webserver_core=debug,csi_webserver=debug` | Tracing filter |
 
 ## License
 

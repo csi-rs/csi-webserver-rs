@@ -234,11 +234,12 @@ Example:
     "ap_dhcp": true,
     "ap_leases": 4,
     "ap_burst": false,
-    "peer_mac": "auto",
-    "ht40": "none"
+    "peer_mac": "broadcast",
+    "ht40": "none",
+    "collection": "collector"
   },
   "collection": {
-    "mode": "collector",
+    "csi_output_enabled": true,
     "traffic_hz": 100,
     "phy_rate": "mcs0-lgi",
     "protocol": "lr",
@@ -270,14 +271,14 @@ Example:
 Notes:
 
 - `wifi`, `collection`, `csi_config` mirror the `show-config` sections.
-- `csi_config` carries both classic (ESP32 / ESP32-C3 / ESP32-S3) and HE
-  (ESP32-C5 / ESP32-C6) fields. The ones applicable to the connected chip
+- `csi_config` carries both classic (ESP32 / ESP32-C3 / ESP32-S3) and
+  ESP32-C5 / ESP32-C6 fields. The ones applicable to the connected chip
   are populated; the others stay `null`. Check `chip` from `GET /api/devices/{id}/info`
   to know which side to read.
 - The classic fields `channel_filter_enabled`, `manual_scale`, and `shift`
   are **read-only on the device** — they have no `POST /api/devices/{id}/config/csi`
   flag, so they only become non-null after `POST /api/devices/{id}/config/reset`
-  (which loads firmware defaults). On HE chips (ESP32-C5/C6), `dump_ack_enabled`
+  (which loads firmware defaults). On ESP32-C5/C6, `dump_ack_enabled`
   is configurable via `set-csi --dump-ack=`.
 - `sta_password` is intentionally **not cached**; round-tripping plaintext
   passwords through a GET endpoint would defeat the point.
@@ -290,13 +291,24 @@ Notes:
   convenience. (The log mode is fixed to `serialized` and is no longer reported.)
 - All fields are nullable (`Option<…>`). Absent fields mean "the
   corresponding endpoint has not been hit since startup / reset-config".
-- `wifi.peer_mac` reads `"auto"` for the default magic-prefix pairing, or an
-  explicit `aa:bb:cc:dd:ee:ff` once set. `wifi.ht40` is `none` / `above` /
-  `below`. Both are ESP-NOW concerns.
+- `collection.csi_output_enabled` mirrors the device's CSI-output toggle (see
+  [`…/config/csi-output`](#post-apidevicesidconfigcsi-output)); firmware default
+  `true`. It says whether captured CSI leaves the device — never whether the
+  device captures.
+- `wifi.peer_mac` is the destination MAC of injected frames in the emitter
+  modes and the explicit peer in the ESP-NOW modes: an explicit
+  `aa:bb:cc:dd:ee:ff` once set, or `"broadcast"` while unset. `wifi.ht40` is
+  `none` / `above` / `below`: the softAP secondary channel in `wifi-ap` mode,
+  and the forced per-peer TX PHY in the ESP-NOW modes. Emitter bandwidth is
+  **not** chosen here — pick `ht20-emitter` or `ht40-emitter`.
+- `wifi.collection` is the node's stored collection mode (`collector` /
+  `listener`), updated when `…/config/wifi` is sent with `collection`.
+  Firmware default `collector`; only the modes that admit a choice read it.
 - After `POST /api/devices/{id}/config/reset`, the cache is replaced with the firmware
   defaults documented in the `show-config` spec (e.g.
-  `wifi.mode = "sniffer"`, `wifi.peer_mac = "auto"`, `wifi.ht40 = "none"`,
-  `collection.traffic_hz = 100`).
+  `wifi.mode = "sniffer"`, `wifi.peer_mac = "broadcast"`, `wifi.ht40 = "none"`,
+  `wifi.collection = "collector"`,
+  `collection.traffic_hz = 100`, `collection.csi_output_enabled = true`).
 
 ### `POST /api/devices/{id}/config/reset`
 
@@ -307,8 +319,16 @@ Request body: none.
 
 ### `POST /api/devices/{id}/config/wifi`
 
-Sets Wi-Fi mode and optional station / channel parameters. Forwards
-`set-wifi`.
+Sets the node's operational mode, its collection mode, and the optional
+station / softAP / channel / peer parameters. Forwards `set-wifi`.
+
+**Operational mode.** `mode` names how the node reaches the channel. It is one
+of four attributes that describe a node — network role, collection mode,
+operational mode, session role — defined in the
+[network model](https://github.com/csi-rs/esp-csi-rs/blob/main/docs/network-model.md).
+Through this route the network role follows from the mode, the collection mode
+is the optional `collection` field, and the session role is always responder:
+the server is the initiator.
 
 Request body:
 
@@ -324,15 +344,31 @@ Request body:
   "ap_burst": false,
   "channel": 6,
   "peer_mac": "aa:bb:cc:dd:ee:ff",
-  "ht40": "above"
+  "ht40": "above",
+  "collection": "collector"
 }
 ```
 
 Required field:
 
-- `mode` — one of `station`, `sniffer`, `wifi-ap`, `esp-now-central`,
-  `esp-now-peripheral`, `esp-now-fast-collector`, `esp-now-fast-source`
-  (requires `esp-csi-cli-rs` ≥ 0.7.0 for the three new values)
+- `mode` — one of:
+
+  | Value | Operational mode | Notes |
+  |-------|------------------|-------|
+  | `station` | Wi-Fi station | Associates to an ESP softAP or a commercial router. |
+  | `wifi-ap` | Wi-Fi access point | Self-contained softAP with DHCP; associated stations generate the uplink that is measured. |
+  | `sniffer` | Wi-Fi sniffer | Locks a channel promiscuously and measures every frame overheard; pairs with an emitter or ambient traffic. |
+  | `ht20-emitter` | Emitter | Raw-injects 802.11n HT PPDUs, 20 MHz; no peer, no handshake. |
+  | `ht40-emitter` | Emitter | Raw-injects 802.11n HT PPDUs, 40 MHz. |
+  | `esp-now-central` | ESP-NOW | Central end of the symmetric connectionless exchange; sources the traffic, auto-pairs with peripherals. |
+  | `esp-now-peripheral` | ESP-NOW | Peripheral end; answers the central's traffic. |
+  | `esp-now-simplex-source` | ESP-NOW simplex | Source end: owns all transmit airtime (a central listener). |
+  | `esp-now-simplex-peer` | ESP-NOW simplex | Peer end: receive-only after discovery (a peripheral collector). |
+  | `esp-now-fast-source` | ESP-NOW simplex | Alias of `esp-now-simplex-source` (the firmware's original token). |
+  | `esp-now-fast-collector` | ESP-NOW simplex | Alias of `esp-now-simplex-peer` (the firmware's original token). |
+
+  Any other value returns `400 Bad Request`, unless an embedder added it
+  through the `CsiProfile` seam (see below).
 
 Optional fields:
 
@@ -362,13 +398,36 @@ Optional fields:
   the associated AP. For other modes it is the operating channel: when omitted
   the server supplies a chip default (`esp32c5` → 149, `esp32c6` → 6, others → 1)
   before forwarding `--set-channel`.
-- `peer_mac` — ESP-NOW peer source MAC, `aa:bb:cc:dd:ee:ff` or `aa-bb-...`
-  (case-insensitive). An **empty string** clears the filter back to automatic
-  magic-prefix pairing. A malformed value returns `400 Bad Request`. All
-  ESP-NOW modes (including fast simplex).
-- `ht40` — forced ESP-NOW TX HT40 secondary channel: `above`, `below`,
-  `none`, or `off` (an alias for `none`). All ESP-NOW modes. Any other value
-  returns `400 Bad Request`.
+- `peer_mac` — `aa:bb:cc:dd:ee:ff` or `aa-bb-...` (case-insensitive). In the
+  **emitter** modes it is the destination address of the injected frames;
+  unicasting to a receiving node's own MAC usually raises that node's CSI
+  rate. In the **ESP-NOW** modes it is the explicit peer, replacing discovery —
+  set it on both nodes. An **empty string** clears it back to broadcast (the
+  default). A malformed value returns `400 Bad Request`.
+- `ht40` — `above`, `below`, `none`, or `off` (an alias for `none`; `none` =
+  HT20). In **`wifi-ap`** mode it runs the softAP as HT40 on that secondary
+  channel; in the **ESP-NOW** modes it forces the per-peer TX PHY. Any other
+  value returns `400 Bad Request`. This does **not** set an emitter's
+  bandwidth: pick `ht40-emitter` for 40 MHz emission.
+- `collection` — `"collector"` or `"listener"` (lowercase); the node's
+  **collection mode**, forwarded as `--collection=`. A collector captures CSI
+  and reports it; a listener captures but does not report. Where it applies:
+
+  | `mode` | `collection` |
+  |--------|--------------|
+  | `station`, `wifi-ap`, `esp-now-central`, `esp-now-peripheral` | accepted, either value |
+  | `sniffer`, `esp-now-simplex-peer` / `esp-now-fast-collector` | `400 Bad Request` — fixed collector |
+  | `ht20-emitter`, `ht40-emitter`, `esp-now-simplex-source` / `esp-now-fast-source` | `400 Bad Request` — fixed listener |
+  | a mode added through `CsiProfile` | passed through unchecked |
+
+  When omitted nothing is forwarded and the device keeps its stored value
+  (firmware default `collector`). The check is made against the `mode` in the
+  same request, which this route requires. The 400 message names the fixed
+  value, e.g. `mode 'sniffer' has a fixed collection mode (collector); omit
+  collection`. Any other value (including a capitalised one) returns
+  `422 Unprocessable Entity` from the JSON extractor. This is distinct from
+  [`…/config/csi-output`](#post-apidevicesidconfigcsi-output), which only
+  gates delivery at runtime.
 
 Notes:
 
@@ -378,15 +437,20 @@ Notes:
 - Values > 32 bytes return `400 Bad Request` (the firmware would otherwise
   panic).
 - Mode-to-feature applicability:
-  - `--set-channel` — all modes (operating channel for sniffer, `wifi-ap`, and
-    `esp-now-*`; optional pre-association hint in `station` mode)
+  - `--set-channel` — all modes (operating channel for `sniffer`, `wifi-ap`,
+    and the emitters; optional pre-association hint in `station` mode)
   - `sta_ssid` / `sta_password` — `station` mode only
   - `ap_ssid` / `ap_password` / `ap_dhcp` / `ap_leases` / `ap_burst` —
     `wifi-ap` mode only
-  - `peer_mac` / `ht40` — all `esp-now-*` modes (including fast simplex;
-    silently ignored by the firmware in other modes)
-  - PHY rate (`/api/devices/{id}/config/rate`) — all modes except `station`
-    (including fast ESP-NOW)
+  - `peer_mac` — the emitter and ESP-NOW modes (silently ignored elsewhere)
+  - `ht40` — `wifi-ap` and the ESP-NOW modes (silently ignored elsewhere)
+  - `collection` — `station`, `wifi-ap`, `esp-now-central`,
+    `esp-now-peripheral` (rejected where the mode fixes it, see above)
+  - PHY rate (`/api/devices/{id}/config/rate`) — applied only by the ESP-NOW
+    pair; reporting only elsewhere.
+- **Modes this server does not list are not part of this surface.** An embedder can add modes
+  through the `CsiProfile` seam in `csi-webserver-core`; sending an unlisted value to a device that
+  does not implement it returns whatever the firmware reports for an unknown mode.
 
 ### `POST /api/devices/{id}/config/traffic`
 
@@ -405,15 +469,15 @@ Request body:
   sends unsolicited echo **replies** instead of echo requests: the peer
   silently ignores them at the IP level, making the traffic strictly
   one-directional. The offered rate stays stable (no reply contention) and
-  the peer/collector captures every frame — but the flooding node itself
+  the receiving node captures every frame — but the flooding node itself
   gets no CSI back. Only meaningful for WiFi AP/station modes with
   `frequency_hz > 0`. When omitted, no flag is forwarded and the firmware
   keeps its current setting (also safe for older firmware without the flag).
 
 ### `POST /api/devices/{id}/config/csi`
 
-Sets CSI feature flags. Forwards `set-csi`. The body merges classic and HE
-options — only flags supported by the firmware's compiled-in variant take
+Sets CSI feature flags. Forwards `set-csi`. The body merges classic and
+ESP32-C5/C6 options — only flags supported by the firmware's compiled-in variant take
 effect; the others are silently ignored on the device side.
 
 All fields are optional. When `preset` is set (`default`), other CSI
@@ -442,30 +506,66 @@ Field groups:
 
 - Classic (ESP32 / ESP32-C3 / ESP32-S3): `lltf`, `htltf`, `stbc_htltf`,
   `ltf_merge`.
-- HE (ESP32-C5 / ESP32-C6): `csi`, `csi_legacy`, `csi_ht20`, `csi_ht40`,
+- ESP32-C5 / ESP32-C6: `csi`, `csi_legacy`, `csi_ht20`, `csi_ht40`,
   `dump_ack`, `val_scale_cfg` (`u32`).
 - ESP32-C5 only: `csi_force_lltf`, `csi_vht`.
-- Preset (C5/C6): `preset` — `default` restores `CsiConfig::default()`.
+- Preset (C5/C6): `preset` — **`default` is the only accepted value**; it restores
+  `CsiConfig::default()`. Other named presets, where they exist, come from an embedder's
+  `CsiProfile` and are not part of this surface.
 
 `val_scale_cfg` ranges are documented in firmware help but
 **not enforced** — out-of-range values are passed through.
 
-### `POST /api/devices/{id}/config/collection-mode`
+### `POST /api/devices/{id}/config/csi-output`
 
-Sets the node role. Forwards `set-collection-mode`.
+The runtime delivery gate: toggles off-device delivery of captured CSI.
+Forwards `set-csi-output --enabled=<true|false>`. It does not change the
+node's collection mode — that is `collection` on
+[`…/config/wifi`](#post-apidevicesidconfigwifi).
 
 Request body:
 
 ```json
-{ "mode": "collector" }
+{ "enabled": true }
 ```
 
-Accepted values:
+- `enabled` — `bool`, **required**. Firmware default: `true`.
+- A missing or non-boolean `enabled` returns `422 Unprocessable Entity`
+  (malformed JSON returns `400 Bad Request`).
 
-- `collector` — active generation + collection
-- `listener` — passive receive only
+What it does and does not do:
 
-Invalid values return `400 Bad Request`.
+- `true` — captured CSI is delivered over the serial transport, decoded by the
+  server, and fanned out to the WebSocket / Parquet dump as usual.
+- `false` — the radio **keeps capturing**; nothing is decoded, logged, or handed
+  to a callback. The RX path and its timing are unchanged, which is the point:
+  use it for a node whose only job is to keep traffic on air, or to measure
+  capture cost separately from delivery cost.
+- On an **emitter** the setting has no effect — an emitter captures nothing.
+- This is not `…/config/io-tasks` `rx: false`, which removes the Wi-Fi-callback
+  CSI path itself, nor `…/config/csi-delivery` `mode: "off"`, which drops only
+  user-side dispatch while the inline log may still run.
+
+Cache: `collection.csi_output_enabled` is updated on success. Applies on the
+next `start`.
+
+#### Migration note (`collection-mode` removed)
+
+`POST …/config/collection-mode` (`set-collection-mode --mode=collector|listener`)
+has been removed (returns `404`). It conflated two settings that are now
+separate:
+
+- **Whether captured CSI leaves the device right now** — this endpoint,
+  `…/config/csi-output` (`set-csi-output --enabled=`), a runtime gate that
+  leaves capture running.
+- **The node's collection mode** — `collection` on `…/config/wifi`
+  (`set-wifi --collection=collector|listener`), read by the modes that admit
+  a choice.
+
+A body of `{"mode": "listener"}` sent here is not a valid request for this
+endpoint; send `{"collection": "listener"}` with the node's `mode` to
+`…/config/wifi` instead. Note that `set-csi-output` had **no effect** on
+firmware before `esp-csi-rs` 0.11, which stored the flag without reading it.
 
 ### Log mode (removed)
 
@@ -503,7 +603,7 @@ The new mode applies on the next received frame.
 
 ### `POST /api/devices/{id}/config/rate`
 
-Pin the Wi-Fi PHY rate. Forwards `set-rate`.
+Set the Wi-Fi PHY rate. Forwards `set-rate`.
 
 Request body:
 
@@ -517,9 +617,11 @@ Request body:
 
 Notes:
 
-- Honored by all modes except `station` on the firmware side (including
-  `wifi-ap`, sniffer, and all ESP-NOW modes including fast simplex).
-- `station` derives its rate from the associated AP and ignores this setting.
+- **Reporting only, except on the ESP-NOW pair.** `esp-now-central` and
+  `esp-now-peripheral` apply it to the frames they send; every other mode
+  stores it and echoes it in `show-config` without changing its TX rate.
+- The emitter modes force their own TX PHY for the sounding frames they
+  inject; `station` derives its rate from the associated AP.
 - Unknown rate values are caught by the firmware (no mutation), not by the
   server.
 
