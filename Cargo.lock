@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "csi-webserver"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "csi-webserver-core",
@@ -454,14 +454,16 @@ dependencies = [
 
 [[package]]
 name = "csi-webserver-core"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33b597ac4849bed61d1a00233a6e9237a6aff19c870e4c1a00e5e9fb1ff8070e"
+checksum = "5d956e16de70e4964a8a607aa6b852d6cad2da3e3fa6cfeb9319bd2ffac79d04"
 dependencies = [
  "arrow-array",
  "arrow-schema",
  "axum",
  "chrono",
+ "cobs",
+ "heapless",
  "parquet",
  "postcard",
  "serde",
@@ -1084,7 +1086,19 @@ dependencies = [
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
  "heapless",
+ "postcard-derive",
  "serde",
+]
+
+[[package]]
+name = "postcard-derive"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0232bd009a197ceec9cc881ba46f727fcd8060a2d8d6a9dde7a69030a6fe2bb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
