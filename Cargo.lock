@@ -455,6 +455,8 @@ dependencies = [
 [[package]]
 name = "csi-webserver-core"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d956e16de70e4964a8a607aa6b852d6cad2da3e3fa6cfeb9319bd2ffac79d04"
 dependencies = [
  "arrow-array",
  "arrow-schema",
